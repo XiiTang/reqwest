@@ -3,7 +3,7 @@ use std::any::Any;
 use std::future::Future;
 use std::net::IpAddr;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{ready, Context, Poll};
 use std::time::Duration;
 use std::{collections::HashMap, convert::TryInto, net::SocketAddr};
@@ -144,16 +144,15 @@ struct HyperService {
 impl Service<hyper::Request<crate::async_impl::body::Body>> for HyperService {
     type Error = crate::Error;
     type Response = http::Response<hyper::body::Incoming>;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + Sync>>;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.hyper.poll_ready(cx).map_err(crate::error::request)
     }
 
     fn call(&mut self, req: hyper::Request<crate::async_impl::body::Body>) -> Self::Future {
-        let clone = self.hyper.clone();
-        let mut inner = std::mem::replace(&mut self.hyper, clone);
-        Box::pin(async move { inner.call(req).await.map_err(crate::error::request) })
+        let fut = self.hyper.call(req);
+        Box::pin(async move { fut.await.map_err(crate::error::request) })
     }
 }
 
@@ -408,6 +407,10 @@ impl ClientBuilder {
     /// cannot load the system configuration.
     pub fn build(self) -> crate::Result<Client> {
         let config = self.config;
+        let exec = hyper_util::rt::TokioExecutor::new();
+        let http1_builder = http1_builder(&config);
+        #[cfg(feature = "http2")]
+        let http2_builder = http2_builder(&config, exec.clone());
 
         if let Some(err) = config.error {
             return Err(err);
@@ -1014,7 +1017,136 @@ impl ClientBuilder {
             Some(format!("{:?}", &config.redirect_policy))
         };
 
-        let hyper_client = builder.build(connector_builder.build(config.connector_layers));
+        macro_rules! http1_pool {
+            () => {{
+                let cache_exec = exec.clone();
+                (
+                    tower::layer::layer_fn(move |svc| {
+                        hyper_util::client::pool::cache::builder()
+                            .executor(cache_exec.clone())
+                            .build(svc)
+                    }),
+                    // map the MakeService response with some HTTP/1 specific middleware
+                    tower::util::MapResponseLayer::new(|svc| {
+                        let svc = hyper_util::client::service::Http1RequestTarget::new(svc);
+                        let svc = hyper_util::client::service::SetHost::new(svc);
+                        Meta::new(svc, MyMeta { idle_at: None })
+                    }),
+                    hyper_util::client::conn::Http1Layer::<crate::Body>::from(
+                        http1_builder.clone(),
+                    ),
+                )
+            }};
+        }
+
+        #[cfg(feature = "http2")]
+        macro_rules! http2_pool {
+            () => {{
+                (
+                    tower::layer::layer_fn(|svc| {
+                        hyper_util::client::pool::singleton::Singleton::new(svc)
+                    }),
+                    hyper_util::client::conn::Http2Layer::<crate::Body, _>::from(
+                        http2_builder.clone(),
+                    ),
+                )
+            }};
+        }
+
+        macro_rules! retain_http1 {
+            ($svc:expr, $now:expr, $idle_dur:expr) => {{
+                $svc.retain(|svc| {
+                    if svc.inner().inner().inner().is_closed() {
+                        return false;
+                    }
+
+                    if let Some(idle_at) = svc.meta().idle_at {
+                        return $now.duration_since(idle_at) < $idle_dur;
+                    }
+                    true
+                });
+                !$svc.is_empty()
+            }};
+        }
+
+        #[cfg(feature = "http2")]
+        macro_rules! retain_http2 {
+            ($svc:expr) => {{
+                $svc.retain(|svc| !svc.is_closed());
+                !$svc.is_empty()
+            }};
+        }
+
+        macro_rules! release_http1 {
+            ($svc:expr, $now:expr) => {
+                $svc.inner_mut().meta_mut().idle_at = Some($now)
+            };
+        }
+
+        let connector = connector_builder.build(config.connector_layers);
+        let hyper_client = match config.http_version_pref {
+            HttpVersionPref::Http1 => build_pool_client(
+                connector,
+                http1_pool!(),
+                config.pool_idle_timeout,
+                |svc, now, idle_dur| retain_http1!(svc, now, idle_dur),
+                |svc, now| release_http1!(svc, now),
+            ),
+            #[cfg(feature = "http2")]
+            HttpVersionPref::Http2 => build_pool_client(
+                connector,
+                http2_pool!(),
+                config.pool_idle_timeout,
+                |svc, _now, _idle_dur| retain_http2!(svc),
+                |_svc, _now| {},
+            ),
+            #[cfg(feature = "http2")]
+            HttpVersionPref::All => {
+                let http1 = http1_pool!();
+                let http2 = http2_pool!();
+                let pool_layer = tower::layer::layer_fn(move |svc| {
+                    hyper_util::client::pool::negotiate::builder()
+                        .fallback(http1.clone())
+                        .upgrade(http2.clone())
+                        .inspect(|conn: &<Connector as Service<Uri>>::Response| {
+                            conn.is_negotiated_h2()
+                        })
+                        .connect(svc)
+                        .build()
+                });
+                build_pool_client(
+                    connector,
+                    pool_layer,
+                    config.pool_idle_timeout,
+                    |svc, now, idle_dur| {
+                        let http1 = retain_http1!(svc.fallback_mut(), now, idle_dur);
+                        let http2 = retain_http2!(svc.upgrade_mut());
+                        http1 || http2
+                    },
+                    |svc, now| {
+                        if let Some(svc) = svc.fallback_mut() {
+                            release_http1!(svc, now);
+                        }
+                    },
+                )
+            }
+            #[cfg(not(feature = "http2"))]
+            HttpVersionPref::All => build_pool_client(
+                connector,
+                http1_pool!(),
+                config.pool_idle_timeout,
+                |svc, now, idle_dur| retain_http1!(svc, now, idle_dur),
+                |svc, now| release_http1!(svc, now),
+            ),
+            #[cfg(feature = "http3")]
+            HttpVersionPref::Http3 => build_pool_client(
+                connector,
+                http1_pool!(),
+                config.pool_idle_timeout,
+                |svc, now, idle_dur| retain_http1!(svc, now, idle_dur),
+                |svc, now| release_http1!(svc, now),
+            ),
+        };
         let hyper_service = HyperService {
             hyper: hyper_client,
         };
@@ -2487,7 +2619,143 @@ impl ClientBuilder {
     }
 }
 
-type HyperClient = hyper_util::client::legacy::Client<Connector, super::Body>;
+//type HyperClient = hyper_util::client::legacy::Client<Connector, super::Body>;
+type HyperClient = tower::util::BoxCloneSyncService<
+    http::Request<super::Body>,
+    http::Response<hyper::body::Incoming>,
+    BoxError,
+>;
+
+fn build_pool_client<L, P, Retain, Release>(
+    connector: Connector,
+    pool_layer: L,
+    idle_timeout: Option<Duration>,
+    retain: Retain,
+    release: Release,
+) -> HyperClient
+where
+    L: Layer<Connector> + Clone + Send + Sync + 'static,
+    L::Service: Service<Uri, Response = P> + Send + 'static,
+    <L::Service as Service<Uri>>::Error: Into<BoxError>,
+    <L::Service as Service<Uri>>::Future: Send + 'static,
+    P: Service<http::Request<super::Body>, Response = http::Response<hyper::body::Incoming>>
+        + Send
+        + 'static,
+    P::Error: Into<BoxError>,
+    P::Future: Send + 'static,
+    Retain:
+        Fn(&mut L::Service, std::time::Instant, Duration) -> bool + Clone + Send + Sync + 'static,
+    Release: Fn(&mut P, std::time::Instant) + Clone + Send + Sync + 'static,
+{
+    let pool_map = hyper_util::client::pool::map::Map::builder::<http::Uri>()
+        .keys(|dst| (dst.scheme().cloned(), dst.authority().cloned()))
+        .values(move |_dst| pool_layer.layer(connector.clone()))
+        .build();
+
+    // We can put the map in an Arc because at this step, backpressure
+    // is no longer relevant.
+    let pool_map = Arc::new(Mutex::new(pool_map));
+
+    if let Some(idle_dur) = idle_timeout {
+        let expire = Arc::downgrade(&pool_map);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(idle_dur).await;
+                let now = std::time::Instant::now();
+                let Some(expire) = expire.upgrade() else {
+                    return;
+                };
+                let retain = retain.clone();
+                expire
+                    .lock()
+                    .unwrap()
+                    .retain(|_key, svc| retain(svc, now, idle_dur));
+            }
+        });
+    }
+
+    let pool_as_svc = tower::service_fn(move |req: http::Request<_>| {
+        let svc_fut = pool_map
+            .lock()
+            .unwrap()
+            .service(req.uri())
+            .call(req.uri().clone());
+        let release = release.clone();
+        async move {
+            let mut svc = svc_fut.await.map_err(Into::into)?;
+            let result = svc.call(req).await.map_err(Into::into);
+            // todo: DelayedRelease wrapping just HTTP/1
+            tokio::spawn(async move {
+                if tower::ServiceExt::ready(&mut svc).await.is_ok() {
+                    release(&mut svc, std::time::Instant::now());
+                }
+            });
+            result
+        }
+    });
+    tower::util::BoxCloneSyncService::new(pool_as_svc)
+}
+
+fn http1_builder(config: &Config) -> hyper::client::conn::http1::Builder {
+    let mut builder = hyper::client::conn::http1::Builder::new();
+
+    if config.http09_responses {
+        builder.http09_responses(true);
+    }
+    if config.http1_title_case_headers {
+        builder.title_case_headers(true);
+    }
+    if config.http1_allow_obsolete_multiline_headers_in_responses {
+        builder.allow_obsolete_multiline_headers_in_responses(true);
+    }
+    if config.http1_ignore_invalid_headers_in_responses {
+        builder.ignore_invalid_headers_in_responses(true);
+    }
+    if config.http1_allow_spaces_after_header_name_in_responses {
+        builder.allow_spaces_after_header_name_in_responses(true);
+    }
+    if let Some(max) = config.http1_max_headers {
+        builder.max_headers(max);
+    }
+
+    builder
+}
+
+#[cfg(feature = "http2")]
+fn http2_builder(
+    config: &Config,
+    exec: hyper_util::rt::TokioExecutor,
+) -> hyper::client::conn::http2::Builder<hyper_util::rt::TokioExecutor> {
+    let mut builder = hyper::client::conn::http2::Builder::new(exec);
+
+    if let Some(size) = config.http2_initial_stream_window_size {
+        builder.initial_stream_window_size(size);
+    }
+    if let Some(size) = config.http2_initial_connection_window_size {
+        builder.initial_connection_window_size(size);
+    }
+    if config.http2_adaptive_window {
+        builder.adaptive_window(true);
+    }
+    if let Some(size) = config.http2_max_frame_size {
+        builder.max_frame_size(size);
+    }
+    if let Some(size) = config.http2_max_header_list_size {
+        builder.max_header_list_size(size);
+    }
+    if let Some(interval) = config.http2_keep_alive_interval {
+        builder.keep_alive_interval(interval);
+    }
+    if let Some(timeout) = config.http2_keep_alive_timeout {
+        builder.keep_alive_timeout(timeout);
+    }
+    if config.http2_keep_alive_while_idle {
+        builder.keep_alive_while_idle(true);
+    }
+    builder.timer(hyper_util::rt::TokioTimer::new());
+
+    builder
+}
 
 impl Default for Client {
     fn default() -> Self {
@@ -3150,6 +3418,54 @@ impl fmt::Debug for Pending {
                 .finish(),
             PendingInner::Error(ref err) => f.debug_struct("Pending").field("error", err).finish(),
         }
+    }
+}
+
+// ===== impl Meta =====
+// TODO: This should likely be it's own middleware in `tower` proper. For now, unblocking myself.
+
+struct MyMeta {
+    //created_at: Instant,
+    idle_at: Option<std::time::Instant>,
+}
+
+struct Meta<S, M> {
+    inner: S,
+    meta: M,
+}
+
+impl<S, M> Meta<S, M> {
+    fn new(inner: S, meta: M) -> Self {
+        Meta { inner, meta }
+    }
+
+    fn inner(&self) -> &S {
+        &self.inner
+    }
+
+    fn meta(&self) -> &M {
+        &self.meta
+    }
+
+    fn meta_mut(&mut self) -> &mut M {
+        &mut self.meta
+    }
+}
+
+impl<S, Req, M> Service<Req> for Meta<S, M>
+where
+    S: Service<Req>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = S::Future;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: Req) -> Self::Future {
+        self.inner.call(req)
     }
 }
 

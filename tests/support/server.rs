@@ -23,6 +23,7 @@ pub struct Server {
 
 #[non_exhaustive]
 pub enum Event {
+    ConnectionOpened,
     ConnectionClosed,
 }
 
@@ -114,6 +115,7 @@ where
                             }
                             accepted = listener.accept() => {
                                 let (io, _) = accepted.expect("accepted");
+                                let _ = events_tx.send(Event::ConnectionOpened);
                                 let func = func.clone();
                                 let svc = hyper::service::service_fn(func);
                                 let builder = builder.clone();

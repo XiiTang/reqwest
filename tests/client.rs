@@ -569,7 +569,11 @@ async fn test_tls_info_version_native_tls() {
 #[tokio::test]
 async fn pool_smoke_test() {
     let server = server::http(|req| async move {
-        let n = req.headers()["x-req-cnt"].to_str().unwrap().parse::<u32>().unwrap();
+        let n = req.headers()["x-req-cnt"]
+            .to_str()
+            .unwrap()
+            .parse::<u32>()
+            .unwrap();
         if n % 3 == 0 {
             http::Response::builder()
                 .header("connection", "close")
@@ -597,6 +601,44 @@ async fn pool_smoke_test() {
     }
 }
 
+async fn assert_pool_reuses_connection(
+    client: &reqwest::Client,
+    server: &mut server::Server,
+    expected_version: reqwest::Version,
+) {
+    let url = format!("http://{}", server.addr());
+
+    for _ in 0..3 {
+        let response = client.get(&url).send().await.unwrap();
+        assert_eq!(response.version(), expected_version);
+        response.bytes().await.unwrap();
+        tokio::task::yield_now().await;
+    }
+
+    let opened = server
+        .events()
+        .into_iter()
+        .filter(|event| matches!(event, server::Event::ConnectionOpened))
+        .count();
+    assert_eq!(opened, 1);
+}
+
+#[tokio::test]
+async fn pool_http1_only_reuses_connection() {
+    let mut server = server::http(|_| async { http::Response::default() });
+    let client = reqwest::Client::builder().http1_only().build().unwrap();
+
+    assert_pool_reuses_connection(&client, &mut server, reqwest::Version::HTTP_11).await;
+}
+
+#[tokio::test]
+async fn pool_default_reuses_negotiated_connection() {
+    let mut server = server::http(|_| async { http::Response::default() });
+    let client = reqwest::Client::new();
+
+    assert_pool_reuses_connection(&client, &mut server, reqwest::Version::HTTP_11).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pool_http2_uses_new_conn_when_recv_goaway() {
     let mut server = server::http(move |_| async move { http::Response::default() });
@@ -610,15 +652,14 @@ async fn pool_http2_uses_new_conn_when_recv_goaway() {
 
     for i in 0..5 {
         println!("start {}", i);
-        client
+        let response = client
             .get(&url)
             .header("x-req-cnt", i)
             .send()
             .await
-            .unwrap()
-            .bytes()
-            .await
             .unwrap();
+        assert_eq!(response.version(), reqwest::Version::HTTP_2);
+        response.bytes().await.unwrap();
     }
 
     // drop the previous server
@@ -626,15 +667,14 @@ async fn pool_http2_uses_new_conn_when_recv_goaway() {
     let url = format!("http://{}", server.addr());
 
     for i in 5..10 {
-        client
+        let response = client
             .get(&url)
             .header("x-req-cnt", i)
             .send()
             .await
-            .unwrap()
-            .bytes()
-            .await
             .unwrap();
+        assert_eq!(response.version(), reqwest::Version::HTTP_2);
+        response.bytes().await.unwrap();
     }
 }
 

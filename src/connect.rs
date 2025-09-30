@@ -1352,6 +1352,13 @@ pub(crate) mod sealed {
         }
     }
 
+    impl Conn {
+        #[cfg(feature = "http2")]
+        pub(crate) fn is_negotiated_h2(&self) -> bool {
+            self.connected().is_negotiated_h2()
+        }
+    }
+
     impl Connection for Conn {
         fn connected(&self) -> Connected {
             let connected = self.inner.connected().proxy(self.is_proxy);

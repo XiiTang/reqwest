@@ -67,6 +67,24 @@ pub(crate) type BoxedConnectorService = BoxCloneSyncService<Unnameable, Conn, Bo
 pub(crate) type BoxedConnectorLayer =
     BoxCloneSyncServiceLayer<BoxedConnectorService, Unnameable, Conn, BoxError>;
 
+// An HTTPS proxy must never receive the origin's client certificate.
+#[cfg(feature = "__rustls")]
+#[derive(Debug)]
+struct NoProxyClientAuth;
+#[cfg(feature = "__rustls")]
+impl rustls::client::ResolvesClientCert for NoProxyClientAuth {
+    fn resolve(
+        &self,
+        _: &[&[u8]],
+        _: &[rustls::SignatureScheme],
+    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        None
+    }
+    fn has_certs(&self) -> bool {
+        false
+    }
+}
+
 pub(crate) struct ConnectorBuilder {
     inner: Inner,
     proxies: Arc<Vec<ProxyMatcher>>,
@@ -386,6 +404,9 @@ where {
         } else {
             let mut tls_proxy = tls.clone();
             tls_proxy.alpn_protocols.clear();
+            // Proxy authentication is independent of the origin client identity.
+            tls_proxy.client_auth_cert_resolver = Arc::new(NoProxyClientAuth);
+            tls_proxy.resumption = rustls::client::Resumption::default();
             (Arc::new(tls), Arc::new(tls_proxy))
         };
 
@@ -661,8 +682,13 @@ impl ConnectorService {
                 }
             }
             #[cfg(feature = "__rustls")]
-            Inner::RustlsTls { http, tls, .. } => {
+            Inner::RustlsTls {
+                http,
+                tls,
+                tls_proxy,
+            } => {
                 let mut http = http.clone();
+                let tls = if is_proxy { tls_proxy } else { tls };
 
                 // Disable Nagle's algorithm for TLS handshake
                 //

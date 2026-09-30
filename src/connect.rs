@@ -838,6 +838,9 @@ impl ConnectorService {
                     if let Some(auth) = auth {
                         tunnel = tunnel.with_auth(auth);
                     }
+                    if let Some(guard) = proxy.auth_guard() {
+                        tunnel = tunnel.with_auth_guard(guard);
+                    }
                     if let Some(ua) = self.user_agent {
                         let mut headers = http::HeaderMap::new();
                         headers.insert(http::header::USER_AGENT, ua);
@@ -882,6 +885,9 @@ impl ConnectorService {
                         hyper_util::client::legacy::connect::proxy::Tunnel::new(proxy_dst, inner);
                     if let Some(auth) = auth {
                         tunnel = tunnel.with_auth(auth);
+                    }
+                    if let Some(guard) = proxy.auth_guard() {
+                        tunnel = tunnel.with_auth_guard(guard);
                     }
                     if let Some(custom_headers) = misc {
                         tunnel = tunnel.with_headers(custom_headers.clone());
@@ -1937,6 +1943,9 @@ mod socks {
                 } else {
                     SocksV5::new(proxy_uri, http_connector)
                 };
+                if let Some(guard) = proxy.auth_guard() {
+                    svc = svc.with_auth_guard(guard);
+                }
                 let stream = Service::call(&mut svc, dst_uri)
                     .await
                     .map_err(|e| SocksProxyError::SocksConnect(e.into()))?;

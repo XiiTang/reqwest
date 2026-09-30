@@ -69,6 +69,7 @@ pub struct NoProxy {
 struct Extra {
     auth: Option<HeaderValue>,
     misc: Option<HeaderMap>,
+    auth_guard: Option<hyper::ext::RequestGuard>,
 }
 
 // ===== Internal =====
@@ -267,10 +268,20 @@ impl Proxy {
             extra: Extra {
                 auth: None,
                 misc: None,
+                auth_guard: None,
             },
             intercept,
             no_proxy: None,
         }
+    }
+
+    /// Check proxy authority at each credential-bearing dispatch boundary.
+    /// Cached connections do not bypass this check for forwarding HTTP requests.
+    pub fn authorization_guard<F, E>(mut self, check: F) -> Proxy
+    where F: Fn() -> Result<(), E> + Send + Sync + 'static,
+          E: Into<Box<dyn std::error::Error + Send + Sync>> {
+        self.extra.auth_guard = Some(hyper::ext::RequestGuard::new(check));
+        self
     }
 
     /// Set the `Proxy-Authorization` header using Basic auth.
@@ -518,6 +529,7 @@ impl Matcher {
             extra: Extra {
                 auth: None,
                 misc: None,
+                auth_guard: None,
             },
             // maybe env vars have auth!
             maybe_has_http_auth: true,
@@ -550,6 +562,10 @@ impl Matcher {
         self.maybe_has_http_auth
     }
 
+    pub(crate) fn http_non_tunnel_auth_guard(&self, dst: &Uri) -> Option<hyper::ext::RequestGuard> {
+        self.http_non_tunnel_basic_auth(dst)?;
+        self.extra.auth_guard.clone()
+    }
     pub(crate) fn http_non_tunnel_basic_auth(&self, dst: &Uri) -> Option<HeaderValue> {
         if let Some(proxy) = self.intercept(dst) {
             let scheme = proxy.uri().scheme();
@@ -591,6 +607,9 @@ impl Intercepted {
         self.inner.uri()
     }
 
+    pub(crate) fn auth_guard(&self) -> Option<hyper::ext::RequestGuard> {
+        self.extra.auth_guard.clone()
+    }
     pub(crate) fn basic_auth(&self) -> Option<&HeaderValue> {
         if let Some(ref val) = self.extra.auth {
             return Some(val);

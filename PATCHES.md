@@ -25,3 +25,14 @@ Boundless consumes a full commit SHA. Before updating that pin, compare with the
 upstream release, retain only still-needed changes, and run this regression plus
 Boundless's transport tests. Remove the fork override when an official release
 provides the same behavior and downstream regressions pass.
+
+## Frozen proxy credential validity
+
+Proxy::authorization_guard installs a caller-owned check in CONNECT and SOCKS5
+connectors, and on each credential-bearing plain HTTP forwarding request.
+The request guard travels into Hyper's actual H1/H2 dispatch, after connection
+and readiness waits. It preserves the original rejection cause. It neither
+adds retries nor applies expiry to response bodies or already authenticated
+tunnels. Boundless tests cover queue, SOCKS greeting, proxy TLS waits, continued
+response reading, and cache separation for equal credentials with different
+validity metadata.

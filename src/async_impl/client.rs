@@ -2645,6 +2645,14 @@ impl Client {
             _ => {
                 let mut req = builder.body(body).expect("valid request parts");
                 *req.headers_mut() = headers.clone();
+                if req.uri().scheme() == Some(&Scheme::HTTP) {
+                    for proxy in self.inner.proxies.iter() {
+                        if let Some(guard) = proxy.http_non_tunnel_auth_guard(req.uri()) {
+                            req.extensions_mut().insert(guard);
+                            break;
+                        }
+                    }
+                }
                 let mut hyper = self.inner.hyper.clone();
                 ResponseFuture::Default(hyper.call(req))
             }

@@ -32,6 +32,10 @@ pub struct Request {
     extensions: Extensions,
 }
 
+/// The request target's path exactly as the caller wrote it.
+#[derive(Clone, Debug)]
+pub(crate) struct ExactPath(pub(crate) String);
+
 /// A builder to construct the properties of a `Request`.
 ///
 /// To construct a `RequestBuilder`, refer to the `Client` documentation.
@@ -169,6 +173,39 @@ impl Request {
 }
 
 impl RequestBuilder {
+    /// Check authority immediately before this request's head is dispatched,
+    /// after connection, pool and readiness waits. A refusal returns its error
+    /// without sending anything; a proxy's guard for the same request also runs.
+    pub fn dispatch_guard<F, E>(mut self, check: F) -> RequestBuilder
+    where
+        F: Fn() -> Result<(), E> + Send + Sync + 'static,
+        E: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        if let Ok(ref mut req) = self.request {
+            req.extensions_mut()
+                .insert(hyper::ext::RequestGuard::new(check));
+        }
+        self
+    }
+
+    /// Send this absolute path instead of the URL's normalized one. Dot
+    /// segments (`.`, `..` and their percent-encoded forms) are sent as written,
+    /// as an S3 object key requires. The URL still supplies the scheme,
+    /// authority and query; the path carries no query or fragment.
+    pub fn exact_path(mut self, path: &str) -> RequestBuilder {
+        let valid = path.starts_with('/')
+            && !path.contains(['?', '#'])
+            && http::uri::PathAndQuery::try_from(path).is_ok();
+        match self.request {
+            Ok(ref mut req) if valid => {
+                req.extensions_mut().insert(ExactPath(path.to_owned()));
+            }
+            Ok(_) => self.request = Err(crate::error::builder("invalid exact request path")),
+            Err(_) => {}
+        }
+        self
+    }
+
     pub(super) fn new(client: Client, request: crate::Result<Request>) -> RequestBuilder {
         let mut builder = RequestBuilder { client, request };
 

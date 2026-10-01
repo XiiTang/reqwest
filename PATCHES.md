@@ -36,3 +36,14 @@ adds retries nor applies expiry to response bodies or already authenticated
 tunnels. Boundless tests cover queue, SOCKS greeting, proxy TLS waits, continued
 response reading, and cache separation for equal credentials with different
 validity metadata.
+
+## Request dispatch guard and exact path
+
+`RequestBuilder::dispatch_guard` installs a caller-owned check that Hyper runs
+immediately before dispatching this request's head, after pool, connection and
+readiness waits; a credential-bearing forwarding proxy's guard runs after it on
+the same request. `RequestBuilder::exact_path` sends an absolute path exactly as
+written, keeping `.`/`..` segments and their percent-encoded forms that `Url`
+would resolve, while the URL keeps the scheme, authority and query. Boundless
+uses both for origin credential expiry and for S3/OSS object keys. Run
+`cargo test --test request_target`.

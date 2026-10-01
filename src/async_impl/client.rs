@@ -2623,6 +2623,25 @@ impl Client {
             Ok(uri) => uri,
             _ => return Pending::new_err(error::url_invalid_uri(url)),
         };
+        let uri = match extensions.get::<super::request::ExactPath>() {
+            None => uri,
+            Some(super::request::ExactPath(path)) => {
+                let mut parts = uri.into_parts();
+                let target = match url.query() {
+                    Some(query) => format!("{path}?{query}"),
+                    None => path.clone(),
+                };
+                parts.path_and_query = match target.parse() {
+                    Ok(target) => Some(target),
+                    Err(_) => return Pending::new_err(error::url_invalid_uri(url)),
+                };
+                match Uri::from_parts(parts) {
+                    Ok(uri) => uri,
+                    Err(_) => return Pending::new_err(error::url_invalid_uri(url)),
+                }
+            }
+        };
+        let request_guard = extensions.get::<hyper::ext::RequestGuard>().cloned();
 
         let body = body.unwrap_or_else(Body::empty);
 
@@ -2639,19 +2658,33 @@ impl Client {
             http::Version::HTTP_3 if self.inner.h3_client.is_some() => {
                 let mut req = builder.body(body).expect("valid request parts");
                 *req.headers_mut() = headers.clone();
+                if let Some(Err(error)) = request_guard.as_ref().map(|guard| guard.check()) {
+                    return Pending::new_err(error::request(error));
+                }
                 let mut h3 = self.inner.h3_client.as_ref().unwrap().clone();
                 ResponseFuture::H3(h3.call(req))
             }
             _ => {
                 let mut req = builder.body(body).expect("valid request parts");
                 *req.headers_mut() = headers.clone();
+                let mut guard = request_guard;
                 if req.uri().scheme() == Some(&Scheme::HTTP) {
                     for proxy in self.inner.proxies.iter() {
-                        if let Some(guard) = proxy.http_non_tunnel_auth_guard(req.uri()) {
-                            req.extensions_mut().insert(guard);
+                        if let Some(proxy_guard) = proxy.http_non_tunnel_auth_guard(req.uri()) {
+                            // Hyper holds one guard per request: run the caller's, then the proxy's.
+                            guard = Some(match guard {
+                                None => proxy_guard,
+                                Some(caller) => hyper::ext::RequestGuard::new(move || {
+                                    caller.check()?;
+                                    proxy_guard.check()
+                                }),
+                            });
                             break;
                         }
                     }
+                }
+                if let Some(guard) = guard {
+                    req.extensions_mut().insert(guard);
                 }
                 let mut hyper = self.inner.hyper.clone();
                 ResponseFuture::Default(hyper.call(req))

@@ -26,26 +26,15 @@ upstream release, retain only still-needed changes, and run this regression plus
 Boundless's transport tests. Remove the fork override when an official release
 provides the same behavior and downstream regressions pass.
 
-## Frozen proxy credential validity
-
-Proxy::authorization_guard installs a caller-owned check in CONNECT and SOCKS5
-connectors, and on each credential-bearing plain HTTP forwarding request.
-The request guard travels into Hyper's actual H1/H2 dispatch, after connection
-and readiness waits. It preserves the original rejection cause. It neither
-adds retries nor applies expiry to response bodies or already authenticated
-tunnels. Boundless tests cover queue, SOCKS greeting, proxy TLS waits, continued
-response reading, and cache separation for equal credentials with different
-validity metadata.
-
 ## Request dispatch guard and exact path
 
 `RequestBuilder::dispatch_guard` installs a caller-owned check that Hyper runs
 immediately before dispatching this request's head, after pool, connection and
-readiness waits; a credential-bearing forwarding proxy's guard runs after it on
-the same request. `RequestBuilder::exact_path` sends an absolute path exactly as
+readiness waits. `RequestBuilder::exact_path` sends an absolute path exactly as
 written, keeping `.`/`..` segments and their percent-encoded forms that `Url`
 would resolve, while the URL keeps the scheme, authority and query. Boundless
-uses both for origin credential expiry and for S3/OSS object keys. Run
+uses the guard to reserve a single-use upstream OAuth refresh token only when the
+request is actually dispatched, and the exact path for S3/OSS object keys. Run
 `cargo test --test request_target`.
 
 
@@ -59,9 +48,7 @@ attempt is bounded to five seconds; single-address and proxy-DNS behavior retain
 the existing timeout contract. The proxy connector's TCP Happy Eyeballs still
 owns dialing the proxy endpoint. Never bypass the proxy or replay HTTP bytes.
 Remote DNS (SOCKS4a/SOCKS5h) sends the original hostname exactly once. Empty local
-answers fail rather than silently delegating local DNS to the proxy. Recheck the
-caller-owned proxy authorization guard before each attempt and preserve the
-existing post-greeting guard at the credential emission boundary.
+answers fail rather than silently delegating local DNS to the proxy.
 
 `cargo test --no-default-features --features rustls,socks --test socks_addresses
 --test request_target --test proxy_tls` passes with the Boundless hyper/hyper-util

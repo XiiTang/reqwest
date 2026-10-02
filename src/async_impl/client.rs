@@ -2667,23 +2667,7 @@ impl Client {
             _ => {
                 let mut req = builder.body(body).expect("valid request parts");
                 *req.headers_mut() = headers.clone();
-                let mut guard = request_guard;
-                if req.uri().scheme() == Some(&Scheme::HTTP) {
-                    for proxy in self.inner.proxies.iter() {
-                        if let Some(proxy_guard) = proxy.http_non_tunnel_auth_guard(req.uri()) {
-                            // Hyper holds one guard per request: run the caller's, then the proxy's.
-                            guard = Some(match guard {
-                                None => proxy_guard,
-                                Some(caller) => hyper::ext::RequestGuard::new(move || {
-                                    caller.check()?;
-                                    proxy_guard.check()
-                                }),
-                            });
-                            break;
-                        }
-                    }
-                }
-                if let Some(guard) = guard {
+                if let Some(guard) = request_guard {
                     req.extensions_mut().insert(guard);
                 }
                 let mut hyper = self.inner.hyper.clone();

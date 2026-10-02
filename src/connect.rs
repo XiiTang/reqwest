@@ -120,6 +120,8 @@ where {
             user_agent: self.user_agent,
             simple_timeout: None,
             #[cfg(feature = "socks")]
+            socks_timeout: self.timeout,
+            #[cfg(feature = "socks")]
             resolver: self.resolver.unwrap_or_else(DynResolver::gai),
             #[cfg(unix)]
             unix_socket: self.unix_socket,
@@ -519,6 +521,8 @@ pub(crate) struct ConnectorService {
     user_agent: Option<HeaderValue>,
     #[cfg(feature = "socks")]
     resolver: DynResolver,
+    #[cfg(feature = "socks")]
+    socks_timeout: Option<Duration>,
     /// If set, this always takes priority over TCP.
     #[cfg(unix)]
     unix_socket: Option<Arc<std::path::Path>>,
@@ -570,7 +574,7 @@ impl ConnectorService {
             Inner::NativeTls(http, tls) => {
                 if dst.scheme() == Some(&Scheme::HTTPS) {
                     let host = dst.host().ok_or("no host in url")?.to_string();
-                    let conn = socks::connect(proxy, dst, dns, &self.resolver, http).await?;
+                    let conn = socks::connect(proxy, dst, dns, &self.resolver, http, self.socks_timeout).await?;
                     let conn = TokioIo::new(conn);
                     let conn = TokioIo::new(conn);
                     let tls_connector = tokio_native_tls::TlsConnector::from(tls.clone());
@@ -591,7 +595,7 @@ impl ConnectorService {
 
                     let tls = tls.clone();
                     let host = dst.host().ok_or("no host in url")?.to_string();
-                    let conn = socks::connect(proxy, dst, dns, &self.resolver, http).await?;
+                    let conn = socks::connect(proxy, dst, dns, &self.resolver, http, self.socks_timeout).await?;
                     let conn = TokioIo::new(conn);
                     let conn = TokioIo::new(conn);
                     let server_name =
@@ -610,7 +614,7 @@ impl ConnectorService {
             }
             #[cfg(not(feature = "__tls"))]
             Inner::Http(http) => {
-                let conn = socks::connect(proxy, dst, dns, &self.resolver, http).await?;
+                let conn = socks::connect(proxy, dst, dns, &self.resolver, http, self.socks_timeout).await?;
                 return Ok(Conn {
                     inner: self.verbose.wrap(TokioIo::new(conn)),
                     is_proxy: false,
@@ -621,7 +625,7 @@ impl ConnectorService {
 
         let resolver = &self.resolver;
         let http = self.inner.get_http_connector();
-        socks::connect(proxy, dst, dns, resolver, http)
+        socks::connect(proxy, dst, dns, resolver, http, self.socks_timeout)
             .await
             .map(|tcp| Conn {
                 inner: self.verbose.wrap(TokioIo::new(tcp)),
@@ -1888,49 +1892,58 @@ mod socks {
         dns_mode: DnsResolve,
         resolver: &crate::dns::DynResolver,
         http_connector: &mut crate::connect::HttpConnector,
+        timeout: Option<std::time::Duration>,
     ) -> Result<TcpStream, SocksProxyError> {
+        let started = tokio::time::Instant::now();
         let https = dst.scheme() == Some(&Scheme::HTTPS);
         let original_host = dst.host().ok_or(SocksProxyError::SocksNoHostInUrl)?;
-        let mut host = original_host.to_owned();
-        let port = match dst.port() {
-            Some(p) => p.as_u16(),
-            None if https => 443u16,
-            _ => 80u16,
-        };
-
-        if let DnsResolve::Local = dns_mode {
-            let maybe_new_target = resolver
-                .http_resolve(&dst)
-                .await
-                .map_err(SocksProxyError::SocksLocalResolve)?
-                .next();
-            if let Some(new_target) = maybe_new_target {
-                log::trace!("socks local dns resolved {new_target:?}");
-                // If the resolved IP is IPv6, wrap it in brackets for URI formatting
-                let ip = new_target.ip();
-                if ip.is_ipv6() {
-                    host = format!("[{}]", ip);
-                } else {
-                    host = ip.to_string();
+        let port = dst.port_u16().unwrap_or(if https { 443 } else { 80 });
+        let targets = match dns_mode {
+            DnsResolve::Proxy => vec![original_host.to_owned()],
+            DnsResolve::Local => {
+                let mut targets = Vec::new();
+                for address in resolver.http_resolve(&dst).await.map_err(SocksProxyError::SocksLocalResolve)? {
+                    if proxy.uri().scheme_str() == Some("socks4") && address.is_ipv6() {
+                        continue;
+                    }
+                    let host = if address.is_ipv6() { format!("[{}]", address.ip()) } else { address.ip().to_string() };
+                    if !targets.contains(&host) { targets.push(host); }
                 }
+                if targets.is_empty() {
+                    return Err(SocksProxyError::SocksLocalResolve(std::io::Error::new(std::io::ErrorKind::NotFound, "SOCKS local DNS returned no supported addresses").into()));
+                }
+                targets
+            }
+        };
+        let count = targets.len();
+        let mut last = None;
+        for (index, host) in targets.into_iter().enumerate() {
+            if let Some(guard) = proxy.auth_guard() {
+                guard.check().map_err(SocksProxyError::SocksConnect)?;
+            }
+            let budget = timeout.map(|limit| limit.saturating_sub(started.elapsed()) / (count - index) as u32)
+                .unwrap_or(std::time::Duration::from_secs(5));
+            let uri = format!("{}://{}:{}", if https { "https" } else { "http" }, host, port)
+                .parse::<Uri>().map_err(|e| SocksProxyError::SocksConnect(e.into()))?;
+            if count == 1 { return connect_target(&proxy, uri, http_connector).await; }
+            match tokio::time::timeout(budget, connect_target(&proxy, uri, http_connector)).await {
+                Ok(Ok(stream)) => return Ok(stream),
+                Ok(Err(error)) => last = Some(error),
+                Err(_) => last = Some(SocksProxyError::SocksConnect(std::io::Error::new(std::io::ErrorKind::TimedOut, "SOCKS address attempt timed out").into())),
             }
         }
+        Err(last.expect("nonempty SOCKS target list"))
+    }
 
-        let proxy_uri = proxy.uri().clone();
-        // Build a Uri for the destination
-        let dst_uri = format!(
-            "{}://{}:{}",
-            if https { "https" } else { "http" },
-            host,
-            port
-        )
-        .parse::<Uri>()
-        .map_err(|e| SocksProxyError::SocksConnect(e.into()))?;
-
+    async fn connect_target(
+        proxy: &Intercepted,
+        dst_uri: Uri,
+        http_connector: &mut crate::connect::HttpConnector,
+    ) -> Result<TcpStream, SocksProxyError> {
         // TODO: can `Scheme::from_static()` be const fn, compare with a SOCKS5 constant?
         match proxy.uri().scheme_str() {
             Some("socks4") | Some("socks4a") => {
-                let mut svc = SocksV4::new(proxy_uri, http_connector);
+                let mut svc = SocksV4::new(proxy.uri().clone(), http_connector);
                 let stream = Service::call(&mut svc, dst_uri)
                     .await
                     .map_err(|e| SocksProxyError::SocksConnect(e.into()))?;
@@ -1938,10 +1951,10 @@ mod socks {
             }
             Some("socks5") | Some("socks5h") => {
                 let mut svc = if let Some((username, password)) = proxy.raw_auth() {
-                    SocksV5::new(proxy_uri, http_connector)
+                    SocksV5::new(proxy.uri().clone(), http_connector)
                         .with_auth(username.to_string(), password.to_string())
                 } else {
-                    SocksV5::new(proxy_uri, http_connector)
+                    SocksV5::new(proxy.uri().clone(), http_connector)
                 };
                 if let Some(guard) = proxy.auth_guard() {
                     svc = svc.with_auth_guard(guard);

@@ -267,6 +267,7 @@ struct Config {
     unix_socket: Option<Arc<std::path::Path>>,
     #[cfg(target_os = "windows")]
     windows_named_pipe: Option<Arc<std::ffi::OsStr>>,
+    dialer: Option<crate::connect::Dialer>,
 }
 
 impl Default for ClientBuilder {
@@ -392,6 +393,7 @@ impl ClientBuilder {
                 unix_socket: None,
                 #[cfg(target_os = "windows")]
                 windows_named_pipe: None,
+                dialer: None,
             },
         }
     }
@@ -935,6 +937,7 @@ impl ClientBuilder {
         connector_builder.set_unix_socket(config.unix_socket);
         #[cfg(target_os = "windows")]
         connector_builder.set_windows_named_pipe(config.windows_named_pipe.clone());
+        connector_builder.set_dialer(config.dialer.clone());
 
         let mut builder =
             hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new());
@@ -1796,6 +1799,29 @@ impl ClientBuilder {
     }
 
     // Alt Transports
+
+    /// Set that every connection's byte stream comes from `dial`, which
+    /// receives the request URI (scheme, host and port) and opens a stream to
+    /// it in place of a TCP connection: through an SSH channel, for example, as
+    /// Go's `Transport.DialContext` allows.
+    ///
+    /// If a request URI uses the `https` scheme, TLS will still be used over
+    /// the dialed stream, with this client's TLS configuration.
+    ///
+    /// # Note
+    ///
+    /// This option is not compatible with any of the TCP or Proxy options.
+    /// Setting this will ignore all those options previously set, and local
+    /// transports. DNS resolution is the dialer's.
+    pub fn dialer<F, Fut, S>(mut self, dial: F) -> ClientBuilder
+    where
+        F: Fn(Uri) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = std::io::Result<S>> + Send + 'static,
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
+    {
+        self.config.dialer = Some(crate::connect::Dialer::new(dial));
+        self
+    }
 
     /// Set that all connections will use this Unix socket.
     ///
@@ -2928,6 +2954,10 @@ impl Config {
         #[cfg(unix)]
         if let Some(ref p) = self.unix_socket {
             f.field("unix_socket", p);
+        }
+
+        if self.dialer.is_some() {
+            f.field("dialer", &true);
         }
     }
 }

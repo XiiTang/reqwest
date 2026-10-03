@@ -55,3 +55,20 @@ answers fail rather than silently delegating local DNS to the proxy.
 and h2 patches. Wire tests cover IPv4/IPv6 rejection followed by success, a stalled
 first attempt, fresh sockets, application bytes sent once, and remote DNS. TLS
 identity separation/resumption and per-request dispatch regressions also pass.
+
+## Caller-supplied connection dialer (2026-10-03)
+
+`ClientBuilder::dialer` takes a function from the request URI to a byte stream
+and uses that stream in place of TCP, as Go's `Transport.DialContext` does.
+Boundless opens each stream through an SSH `direct-tcpip` channel when an
+operation routes through an SSH jump connection. TLS for `https` runs over the
+dialed stream with the client's own trust, identity and origin name; proxies,
+local transports and DNS are not consulted, as with `unix_socket`. Pooled
+connections are reused as for TCP. A dial error is the request's connection
+error. The dialed stream needs only `Send`: `Dialed` reaches it through
+`SyncWrapper`.
+
+`cargo test --no-default-features --features rustls,socks --test dialer` covers
+HTTP over a dialed stream with a proxy configured, pooled reuse, HTTPS with
+client mTLS and origin-name verification, and a failed dial. `native-tls` and
+the no-TLS build also compile.

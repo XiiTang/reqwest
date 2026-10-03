@@ -102,6 +102,7 @@ pub(crate) struct ConnectorBuilder {
     unix_socket: Option<Arc<std::path::Path>>,
     #[cfg(target_os = "windows")]
     windows_named_pipe: Option<Arc<std::ffi::OsStr>>,
+    dialer: Option<Dialer>,
 }
 
 impl ConnectorBuilder {
@@ -127,7 +128,13 @@ where {
             unix_socket: self.unix_socket,
             #[cfg(target_os = "windows")]
             windows_named_pipe: self.windows_named_pipe,
+            dialer: self.dialer,
         };
+
+        if base_service.dialer.is_some() && !base_service.proxies.is_empty() {
+            base_service.proxies = Default::default();
+            log::trace!("dialer() set, proxies are ignored");
+        }
 
         #[cfg(unix)]
         if base_service.unix_socket.is_some() && !base_service.proxies.is_empty() {
@@ -239,6 +246,7 @@ where {
             unix_socket: None,
             #[cfg(target_os = "windows")]
             windows_named_pipe: None,
+            dialer: None,
         }
     }
 
@@ -352,6 +360,7 @@ where {
             unix_socket: None,
             #[cfg(target_os = "windows")]
             windows_named_pipe: None,
+            dialer: None,
         }
     }
 
@@ -430,6 +439,7 @@ where {
             unix_socket: None,
             #[cfg(target_os = "windows")]
             windows_named_pipe: None,
+            dialer: None,
         }
     }
 
@@ -500,6 +510,10 @@ where {
     pub(crate) fn set_windows_named_pipe(&mut self, pipe: Option<Arc<std::ffi::OsStr>>) {
         self.windows_named_pipe = pipe;
     }
+
+    pub(crate) fn set_dialer(&mut self, dialer: Option<Dialer>) {
+        self.dialer = dialer;
+    }
 }
 
 #[allow(missing_debug_implementations)]
@@ -528,6 +542,8 @@ pub(crate) struct ConnectorService {
     unix_socket: Option<Arc<std::path::Path>>,
     #[cfg(target_os = "windows")]
     windows_named_pipe: Option<Arc<std::ffi::OsStr>>,
+    /// If set, this takes priority over every other transport.
+    dialer: Option<Dialer>,
 }
 
 #[derive(Clone)]
@@ -810,6 +826,68 @@ impl ConnectorService {
         }
     }
 
+    /// Connect over the byte stream a caller's dialer opens, with the same TLS
+    /// and HTTP as a TCP connection.
+    async fn connect_dialed(self, dst: Uri) -> Result<Conn, BoxError> {
+        let dialer = self.dialer.clone().expect("connect dialed must have a dialer");
+        let svc = tower::service_fn(move |dst: Uri| {
+            let dialing = (dialer.0)(dst);
+            async move { dialing.await.map(TokioIo::new) }
+        });
+        let is_proxy = false;
+        match self.inner {
+            #[cfg(not(feature = "__tls"))]
+            Inner::Http(..) => {
+                let mut svc = svc;
+                let io = svc.call(dst).await?;
+                Ok(Conn {
+                    inner: self.verbose.wrap(io),
+                    is_proxy,
+                    tls_info: false,
+                })
+            }
+            #[cfg(feature = "__native-tls")]
+            Inner::NativeTls(_, tls) => {
+                let tls_connector = tokio_native_tls::TlsConnector::from(tls.clone());
+                let mut http = hyper_tls::HttpsConnector::from((svc, tls_connector));
+                let io = http.call(dst).await?;
+
+                if let hyper_tls::MaybeHttpsStream::Https(stream) = io {
+                    Ok(Conn {
+                        inner: self.verbose.wrap(NativeTlsConn { inner: stream }),
+                        is_proxy,
+                        tls_info: self.tls_info,
+                    })
+                } else {
+                    Ok(Conn {
+                        inner: self.verbose.wrap(io),
+                        is_proxy,
+                        tls_info: false,
+                    })
+                }
+            }
+            #[cfg(feature = "__rustls")]
+            Inner::RustlsTls { tls, .. } => {
+                let mut http = hyper_rustls::HttpsConnector::from((svc, tls.clone()));
+                let io = http.call(dst).await?;
+
+                if let hyper_rustls::MaybeHttpsStream::Https(stream) = io {
+                    Ok(Conn {
+                        inner: self.verbose.wrap(RustlsTlsConn { inner: stream }),
+                        is_proxy,
+                        tls_info: self.tls_info,
+                    })
+                } else {
+                    Ok(Conn {
+                        inner: self.verbose.wrap(io),
+                        is_proxy,
+                        tls_info: false,
+                    })
+                }
+            }
+        }
+    }
+
     async fn connect_via_proxy(self, dst: Uri, proxy: Intercepted) -> Result<Conn, BoxError> {
         log::debug!("proxy({proxy:?}) intercepts '{:?}'", dst.host());
 
@@ -959,6 +1037,11 @@ impl Service<Uri> for ConnectorService {
         log::debug!("starting new connection '{:?}'", dst.host());
         let timeout = self.simple_timeout;
 
+        // A caller's dialer replaces TCP and skips proxies.
+        if self.dialer.is_some() {
+            return Box::pin(with_timeout(self.clone().connect_dialed(dst), timeout));
+        }
+
         // Local transports (UDS, Windows Named Pipes) skip proxies
         #[cfg(any(unix, target_os = "windows"))]
         if self.should_use_local_transport() {
@@ -1077,6 +1160,123 @@ impl TlsInfoFactory
 
 #[cfg(feature = "__rustls")]
 impl TlsInfoFactory for hyper_rustls::MaybeHttpsStream<TokioIo<tokio::net::TcpStream>> {
+    fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
+        match self {
+            hyper_rustls::MaybeHttpsStream::Https(tls) => tls.tls_info(),
+            hyper_rustls::MaybeHttpsStream::Http(_) => None,
+        }
+    }
+}
+
+// ===== Dialed =====
+
+type DialFuture = Pin<Box<dyn Future<Output = io::Result<Dialed>> + Send>>;
+
+/// A caller-supplied source of connection byte streams.
+#[derive(Clone)]
+pub(crate) struct Dialer(Arc<dyn Fn(Uri) -> DialFuture + Send + Sync>);
+
+impl Dialer {
+    pub(crate) fn new<F, Fut, S>(dial: F) -> Self
+    where
+        F: Fn(Uri) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = io::Result<S>> + Send + 'static,
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
+    {
+        Dialer(Arc::new(move |dst| {
+            let dialing = dial(dst);
+            Box::pin(async move {
+                let stream = dialing.await?;
+                Ok(Dialed(sync_wrapper::SyncWrapper::new(Box::new(stream))))
+            })
+        }))
+    }
+}
+
+trait DialedIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin> DialedIo for T {}
+
+/// A byte stream a caller's dialer opened. Only `&mut` reaches it, so a
+/// stream that is `Send` but not `Sync` can back a pooled connection.
+pub(crate) struct Dialed(sync_wrapper::SyncWrapper<Box<dyn DialedIo>>);
+
+impl tokio::io::AsyncRead for Dialed {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(self.get_mut().0.get_mut()).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for Dialed {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(self.get_mut().0.get_mut()).poll_write(cx, buf)
+    }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(self.get_mut().0.get_mut()).poll_flush(cx)
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(self.get_mut().0.get_mut()).poll_shutdown(cx)
+    }
+}
+
+impl Connection for Dialed {
+    fn connected(&self) -> Connected {
+        Connected::new()
+    }
+}
+
+#[cfg(feature = "__tls")]
+impl TlsInfoFactory for Dialed {
+    fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
+        None
+    }
+}
+
+#[cfg(feature = "__native-tls")]
+impl TlsInfoFactory for tokio_native_tls::TlsStream<TokioIo<TokioIo<Dialed>>> {
+    fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
+        let peer_certificate = self
+            .get_ref()
+            .peer_certificate()
+            .ok()
+            .flatten()
+            .and_then(|c| c.to_der().ok());
+        Some(crate::tls::TlsInfo { peer_certificate })
+    }
+}
+
+#[cfg(feature = "__native-tls")]
+impl TlsInfoFactory for hyper_tls::MaybeHttpsStream<TokioIo<Dialed>> {
+    fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
+        match self {
+            hyper_tls::MaybeHttpsStream::Https(tls) => tls.tls_info(),
+            hyper_tls::MaybeHttpsStream::Http(_) => None,
+        }
+    }
+}
+
+#[cfg(feature = "__rustls")]
+impl TlsInfoFactory for tokio_rustls::client::TlsStream<TokioIo<TokioIo<Dialed>>> {
+    fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
+        let peer_certificate = self
+            .get_ref()
+            .1
+            .peer_certificates()
+            .and_then(|certs| certs.first())
+            .map(|c| c.to_vec());
+        Some(crate::tls::TlsInfo { peer_certificate })
+    }
+}
+
+#[cfg(feature = "__rustls")]
+impl TlsInfoFactory for hyper_rustls::MaybeHttpsStream<TokioIo<Dialed>> {
     fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
         match self {
             hyper_rustls::MaybeHttpsStream::Https(tls) => tls.tls_info(),
@@ -1607,6 +1807,19 @@ mod native_tls_conn {
         }
     }
 
+    impl Connection for NativeTlsConn<TokioIo<TokioIo<super::Dialed>>> {
+        fn connected(&self) -> Connected {
+            let connected = Connected::new();
+            #[cfg(feature = "__native-tls-alpn")]
+            match self.inner.inner().get_ref().negotiated_alpn().ok() {
+                Some(Some(alpn_protocol)) if alpn_protocol == b"h2" => connected.negotiated_h2(),
+                _ => connected,
+            }
+            #[cfg(not(feature = "__native-tls-alpn"))]
+            connected
+        }
+    }
+
     impl<T: AsyncRead + AsyncWrite + Unpin> Read for NativeTlsConn<T> {
         fn poll_read(
             self: Pin<&mut Self>,
@@ -1781,6 +1994,22 @@ mod rustls_tls_conn {
             TokioIo<MaybeHttpsStream<TokioIo<tokio::net::windows::named_pipe::NamedPipeClient>>>,
         >
     {
+        fn connected(&self) -> Connected {
+            if self.inner.inner().get_ref().1.alpn_protocol() == Some(b"h2") {
+                self.inner
+                    .inner()
+                    .get_ref()
+                    .0
+                    .inner()
+                    .connected()
+                    .negotiated_h2()
+            } else {
+                self.inner.inner().get_ref().0.inner().connected()
+            }
+        }
+    }
+
+    impl Connection for RustlsTlsConn<TokioIo<TokioIo<super::Dialed>>> {
         fn connected(&self) -> Connected {
             if self.inner.inner().get_ref().1.alpn_protocol() == Some(b"h2") {
                 self.inner

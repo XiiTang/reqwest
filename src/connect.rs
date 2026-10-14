@@ -2141,11 +2141,18 @@ mod socks {
         let count = targets.len();
         let mut last = None;
         for (index, host) in targets.into_iter().enumerate() {
-            let budget = timeout.map(|limit| limit.saturating_sub(started.elapsed()) / (count - index) as u32)
-                .unwrap_or(std::time::Duration::from_secs(5));
+            // Only a configured timeout is shared among the addresses; without
+            // one, an attempt has no bound of its own.
+            let budget = timeout.map(|limit| limit.saturating_sub(started.elapsed()) / (count - index) as u32);
             let uri = format!("{}://{}:{}", if https { "https" } else { "http" }, host, port)
                 .parse::<Uri>().map_err(|e| SocksProxyError::SocksConnect(e.into()))?;
             if count == 1 { return connect_target(&proxy, uri, http_connector).await; }
+            let Some(budget) = budget else {
+                match connect_target(&proxy, uri, http_connector).await {
+                    Ok(stream) => return Ok(stream),
+                    Err(error) => { last = Some(error); continue; }
+                }
+            };
             match tokio::time::timeout(budget, connect_target(&proxy, uri, http_connector)).await {
                 Ok(Ok(stream)) => return Ok(stream),
                 Ok(Err(error)) => last = Some(error),

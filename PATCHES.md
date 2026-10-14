@@ -38,23 +38,30 @@ request is actually dispatched, and the exact path for S3/OSS object keys. Run
 `cargo test --test request_target`.
 
 
-## SOCKS local DNS address attempts (2026-10-03)
+## SOCKS local DNS address attempts (2026-10-14)
 
 Local DNS considers every supported address (IPv4 and IPv6 for SOCKS5; IPv4 for
-SOCKS4), opening a fresh proxy connection for each failed/stalled CONNECT. Before
-multiple-address attempts, allocate the remaining configured connect timeout
-among the remaining addresses. With no configured timeout, a multiple-address
-attempt is bounded to five seconds; single-address and proxy-DNS behavior retain
-the existing timeout contract. The proxy connector's TCP Happy Eyeballs still
-owns dialing the proxy endpoint. Never bypass the proxy or replay HTTP bytes.
-Remote DNS (SOCKS4a/SOCKS5h) sends the original hostname exactly once. Empty local
-answers fail rather than silently delegating local DNS to the proxy.
+SOCKS4), opening a fresh proxy connection for each failed/stalled CONNECT. A
+configured connect timeout is the only bound: before each of several address
+attempts, the time it leaves is divided among the addresses that remain, as
+hyper-util's `HttpConnector` divides its own between addresses. Without one, an
+attempt is bounded by nothing but its own outcome, and the next address is tried
+only after it fails; no fixed duration stands in for a timeout nobody declared.
+Single-address and proxy-DNS behavior retain the existing timeout contract. The
+proxy connector's TCP Happy Eyeballs still owns dialing the proxy endpoint. Never
+bypass the proxy or replay HTTP bytes. Remote DNS (SOCKS4a/SOCKS5h) sends the
+original hostname exactly once. Empty local answers fail rather than silently
+delegating local DNS to the proxy.
 
 `cargo test --no-default-features --features rustls,socks --test socks_addresses
 --test request_target --test proxy_tls` passes with the Boundless hyper/hyper-util
 and h2 patches. Wire tests cover IPv4/IPv6 rejection followed by success, a stalled
-first attempt, fresh sockets, application bytes sent once, and remote DNS. TLS
-identity separation/resumption and per-request dispatch regressions also pass.
+first attempt that shares a configured connect timeout, fresh sockets, application
+bytes sent once, and remote DNS. On a paused clock, a first address that answers
+after sixty seconds without a connect timeout is the connection and no second
+address is dialed; the 2026-10-03 patch, which bounded each attempt to five
+seconds, fails that test. TLS identity separation/resumption and per-request
+dispatch regressions also pass.
 
 ## Caller-supplied connection dialer (2026-10-03)
 

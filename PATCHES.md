@@ -3,6 +3,31 @@
 Based on upstream `v0.13.4` (`11489b34eda6d32b15ad4033e62beba2ee401350`).
 Retain upstream history and licenses; keep application behavior outside this fork.
 
+## Caller-supplied HTTP executor (2026-10-15)
+
+`ClientBuilder::executor(exec)` passes the caller's executor to hyper-util's
+legacy client, so its connection and pool tasks have the same owner as the
+requests. Its bound matches that client's builder:
+`E: hyper::rt::Executor<Pin<Box<dyn Future<Output = ()> + Send>>> + Send + Sync + Clone + 'static`.
+Storage is `Arc<dyn Executor<BoxSendFuture> + Send + Sync>`, behind a cloneable
+forwarder as in hyper-util; the default remains `TokioExecutor`. This option
+does not change reqwest's separate blocking runtime or HTTP/3 implementation.
+
+On macOS arm64 with Rust 1.97.0 and Boundless's pinned hyper/hyper-util/h2,
+`cargo test --locked --no-default-features --features rustls,socks,http2
+--test executor --test dialer --test proxy_tls --test request_target` passes
+all 8 tests (exit 0). The executor regression takes the connection future
+without running it, observes the request still pending, then runs it and
+receives the response. Restoring the old hard-coded Tokio executor makes
+that regression fail (exit 101). Existing dialer, TLS identity/resumption,
+dispatch-guard and exact-path regressions pass.
+
+Strict `cargo clippy --all-targets --locked --no-default-features --features
+rustls,socks,http2 -- -D warnings` remains blocked (exit 101) by pre-existing
+library and library-test lints, including `connect.rs`'s `non_minimal_cfg` and
+the upstream test modules' `mixed_attributes_style`. No lint suppression or
+baseline repair is part of this patch.
+
 `src/connect.rs` separates HTTPS proxy TLS from the origin's client identity.
 The proxy config offers no client certificate, uses a separate resumption store,
 retains the server verifier, and serves both HTTP forwarding and HTTPS CONNECT.

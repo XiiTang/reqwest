@@ -160,6 +160,7 @@ impl Service<hyper::Request<crate::async_impl::body::Body>> for HyperService {
 struct Config {
     // NOTE: When adding a new field, update `fmt::Debug for ClientBuilder`
     accepts: Accepts,
+    executor: Exec,
     headers: HeaderMap,
     #[cfg(feature = "__tls")]
     hostname_verification: bool,
@@ -276,7 +277,37 @@ impl Default for ClientBuilder {
     }
 }
 
+type BoxSendFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+// Match hyper-util's erased executor storage while keeping it cloneable.
+#[derive(Clone)]
+struct Exec(Arc<dyn hyper::rt::Executor<BoxSendFuture> + Send + Sync>);
+
+impl hyper::rt::Executor<BoxSendFuture> for Exec {
+    fn execute(&self, future: BoxSendFuture) {
+        self.0.execute(future);
+    }
+}
+
+impl fmt::Debug for Exec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Executor").finish()
+    }
+}
+
 impl ClientBuilder {
+    /// Sets the executor for the HTTP client's background connection and pool tasks.
+    ///
+    /// The default is Hyper's Tokio executor. This has the same bound as
+    /// `hyper_util::client::legacy::Client::builder`.
+    pub fn executor<E>(mut self, executor: E) -> Self
+    where
+        E: hyper::rt::Executor<BoxSendFuture> + Send + Sync + Clone + 'static,
+    {
+        self.config.executor = Exec(Arc::new(executor));
+        self
+    }
+
     /// Constructs a new `ClientBuilder`.
     ///
     /// This is the same as `Client::builder()`.
@@ -288,6 +319,7 @@ impl ClientBuilder {
             config: Config {
                 error: None,
                 accepts: Accepts::default(),
+                executor: Exec(Arc::new(hyper_util::rt::TokioExecutor::new())),
                 headers,
                 #[cfg(feature = "__tls")]
                 hostname_verification: true,
@@ -939,8 +971,7 @@ impl ClientBuilder {
         connector_builder.set_windows_named_pipe(config.windows_named_pipe.clone());
         connector_builder.set_dialer(config.dialer.clone());
 
-        let mut builder =
-            hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new());
+        let mut builder = hyper_util::client::legacy::Client::builder(config.executor);
         #[cfg(feature = "http2")]
         {
             if matches!(config.http_version_pref, HttpVersionPref::Http2) {
@@ -2832,6 +2863,7 @@ impl Config {
         }
 
         f.field("accepts", &self.accepts);
+        f.field("executor", &self.executor);
 
         if !self.proxies.is_empty() {
             f.field("proxies", &self.proxies);

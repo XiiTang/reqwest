@@ -8,7 +8,9 @@ Retain upstream history and licenses; keep application behavior outside this for
 `ClientBuilder::executor(exec)` passes the caller's executor to hyper-util's
 legacy client, so its connection and pool tasks have the same owner as the
 requests. Its bound matches that client's builder:
-`E: hyper::rt::Executor<Pin<Box<dyn Future<Output = ()> + Send>>> + Send + Sync + Clone + 'static`.
+`E: hyper::rt::Executor<BoxSendFuture> + Send + Sync + Clone + 'static`,
+where the boxed future returns `Result<(), Box<dyn Error + Send + Sync>>`
+with the matching Boundless hyper-util fork (see batch 5 below).
 Storage is `Arc<dyn Executor<BoxSendFuture> + Send + Sync>`, behind a cloneable
 forwarder as in hyper-util; the default remains `TokioExecutor`. This option
 does not change reqwest's separate blocking runtime or HTTP/3 implementation.
@@ -104,3 +106,25 @@ error. The dialed stream needs only `Send`: `Dialed` reaches it through
 HTTP over a dialed stream with a proxy configured, pooled reuse, HTTPS with
 client mTLS and origin-name verification, and a failed dial. `native-tls` and
 the no-TLS build also compile.
+
+## Preserve the supplied executor's Result handoff (#63, batch 5)
+
+The executor's boxed future now has the same Result output as the matching
+hyper-util fork, preserving the previously chosen ClientBuilder bound and Arc
+storage. Exec::execute is the sole forwarder from hyper-util to the supplied
+executor; it forwards the result-bearing future unchanged. There is no new
+executor method, callback, error policy or response rewriting.
+
+The old unit-output alias fails to compile against hyper-util 761d31e (E0277),
+so the alias and its existing executor fixture change together. The new
+regression the_supplied_executor_reads_a_background_failure_after_a_successful_response
+injects an actual I/O failure after a successful response, joins the actual
+connection future handed to the supplied executor and checks the original
+cause. It leaves that successful response unchanged. The existing held-driver
+fixture now also reads its successful Result.
+
+Validation uses command-line Cargo patches for the matching hyper 3c96ddc9,
+hyper-util 761d31e and h2 7b547e04. No Cargo manifest or lockfile patch is shipped.
+On macOS arm64 the selected executor/dialer/proxy_tls/request_target suite
+passes all 9 tests (exit 0). Strict Clippy results are recorded with the
+Boundless batch-5 evidence; no unrelated lint repair is included.

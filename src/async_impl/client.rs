@@ -277,7 +277,7 @@ impl Default for ClientBuilder {
     }
 }
 
-type BoxSendFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
+type BoxSendFuture = Pin<Box<dyn Future<Output = Result<(), BoxError>> + Send>>;
 
 // Match hyper-util's erased executor storage while keeping it cloneable.
 #[derive(Clone)]

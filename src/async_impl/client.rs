@@ -185,6 +185,7 @@ struct Config {
     auto_sys_proxy: bool,
     redirect_policy: redirect::Policy,
     retry_policy: crate::retry::Builder,
+    retry_canceled_requests: bool,
     referer: bool,
     read_timeout: Option<Duration>,
     timeout: Option<Duration>,
@@ -342,6 +343,7 @@ impl ClientBuilder {
                 auto_sys_proxy: true,
                 redirect_policy: redirect::Policy::default(),
                 retry_policy: crate::retry::Builder::default(),
+                retry_canceled_requests: true,
                 referer: true,
                 read_timeout: None,
                 timeout: None,
@@ -972,6 +974,7 @@ impl ClientBuilder {
         connector_builder.set_dialer(config.dialer.clone());
 
         let mut builder = hyper_util::client::legacy::Client::builder(config.executor);
+        builder.retry_canceled_requests(config.retry_canceled_requests);
         #[cfg(feature = "http2")]
         {
             if matches!(config.http_version_pref, HttpVersionPref::Http2) {
@@ -1434,10 +1437,25 @@ impl ClientBuilder {
 
     /// Set a request retry policy.
     ///
-    /// Default behavior is to retry protocol NACKs.
+    /// Default behavior is to retry protocol NACKs. This is separate from the
+    /// connection retry controlled by [`ClientBuilder::retry_canceled_requests`].
+    /// To disable both layers, use `retry(retry::never())` and
+    /// `retry_canceled_requests(false)`.
     // XXX: accept an `impl retry::IntoPolicy` instead?
     pub fn retry(mut self, policy: crate::retry::Builder) -> ClientBuilder {
         self.config.retry_policy = policy;
+        self
+    }
+
+    /// Retry requests that never started on an idle, reused connection.
+    ///
+    /// Default is `true`, matching hyper-util. Set this to `false` when the
+    /// caller owns resends. This also disables hyper-util's closed-checkout
+    /// retry, and is independent of [`ClientBuilder::retry`]. The returned
+    /// error retains hyper-util's unstarted-on-reused-connection fact in its
+    /// source chain.
+    pub fn retry_canceled_requests(mut self, enable: bool) -> ClientBuilder {
+        self.config.retry_canceled_requests = enable;
         self
     }
 

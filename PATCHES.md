@@ -34,8 +34,9 @@ retains the server verifier, and serves both HTTP forwarding and HTTPS CONNECT.
 Origin mTLS inside CONNECT retains its identity and resumption store.
 
 The hyper-util dependency is fixed at `0.1.20` so Boundless's root Cargo patch cannot
-be bypassed by an ordinary dependency update. This fork does not change retries,
-DNS policy, certificate trust or connection-pool recovery.
+be bypassed by an ordinary dependency update. Connection retries are controlled
+by `ClientBuilder::retry_canceled_requests`; their default, DNS policy and
+certificate trust retain the upstream behavior.
 
 Run the synthetic local TLS regression with:
 
@@ -104,3 +105,36 @@ error. The dialed stream needs only `Send`: `Dialed` reaches it through
 HTTP over a dialed stream with a proxy configured, pooled reuse, HTTPS with
 client mTLS and origin-name verification, and a failed dial. `native-tls` and
 the no-TLS build also compile.
+
+## Caller-owned reused-connection retries (driver plan v23 W7a, Rule 8)
+
+At 637d9d6, `src/async_impl/client.rs:974` builds hyper-util's legacy client
+without setting or exposing its `retry_canceled_requests` option. The
+hyper-util 66402f8 default is `true` (`client/legacy/client.rs:1034`),
+independent of reqwest's policy layer (`src/async_impl/client.rs:1057-1059`).
+Thus `retry(retry::never())` alone still permits an unrecorded connection
+retry. This is the failure class governed here; no other resend policy is
+changed.
+
+Async and blocking `ClientBuilder::retry_canceled_requests(bool)` forward
+the setting at the one legacy-client construction point. Its default
+remains `true`, matching hyper-util and preserving existing clients. The
+configuration is private and is set through that builder, so every legacy
+client receives it. Boundless's attempt owner selects both
+`retry(retry::never())` and `retry_canceled_requests(false)`. The paired
+hyper-util patch exposes `Error::is_unstarted_on_reused_connection()`;
+reqwest already retains that error in its source chain. No Execution or
+per-attempt callback is introduced. Retry module and builder help explain
+the two independent controls.
+
+`tests/reused_connection_retry.rs` holds the native driver and retires it
+after a second request is queued on the reused connection but before it is
+taken. With the option off, no second dial or peer request occurs and the
+source chain retains the unstarted fact. Without the new option, default
+connection retry still makes a second dial and request even though the
+reqwest policy is `never`. Ignoring the forwarded option reproduces the
+regression (exit 101); the fixed test passes (exit 0). The complete suite
+with the enabled feature set passes on macOS arm64, Rust 1.98.1:
+334 tests, four ignored (exit 0); fmt passes (exit 0). Strict all-targets
+clippy exits 101 with the original base's diagnostics, with no suppression or independent
+repair. The W7a patch is carried independently of W4a completion forwarding.

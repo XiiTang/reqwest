@@ -344,7 +344,8 @@ impl ClientBuilder {
 
     /// Set a request retry policy.
     ///
-    /// Default behavior is to retry protocol NACKs.
+    /// Default behavior is to retry protocol NACKs. Connection retries are
+    /// controlled separately by [`ClientBuilder::retry_canceled_requests`].
     pub fn retry(self, policy: crate::retry::Builder) -> ClientBuilder {
         self.with_inner(move |inner| inner.retry(policy))
     }
@@ -354,6 +355,15 @@ impl ClientBuilder {
     /// Default is `true`.
     pub fn referer(self, enable: bool) -> ClientBuilder {
         self.with_inner(|inner| inner.referer(enable))
+    }
+
+    /// Retry requests that never started on an idle, reused connection.
+    ///
+    /// Default is `true`. This is independent of [`ClientBuilder::retry`].
+    /// Set both this option to `false` and `retry(retry::never())` when the
+    /// caller owns every resend.
+    pub fn retry_canceled_requests(self, enable: bool) -> ClientBuilder {
+        self.with_inner(move |inner| inner.retry_canceled_requests(enable))
     }
 
     // Proxy options

@@ -16,6 +16,10 @@
 //! All policies default to including a retry budget that permits 20% extra
 //! requests to be sent.
 //!
+//! Retrying an unstarted request on a reused connection is controlled separately
+//! by [`crate::ClientBuilder::retry_canceled_requests`]. To let the caller own
+//! every resend, disable that option as well as using [`never()`].
+//!
 //! # Scoped
 //!
 //! A client's retry policy is scoped. That means that the policy doesn't
@@ -84,7 +88,8 @@ where
 /// Create a retry policy that will never retry any request.
 ///
 /// This is useful for disabling the `Client`s default behavior of retrying
-/// protocol nacks.
+/// protocol nacks. To also disable unstarted-request connection retries, set
+/// [`crate::ClientBuilder::retry_canceled_requests`] to `false`.
 pub fn never() -> Builder {
     scoped(|_| false).no_budget()
 }

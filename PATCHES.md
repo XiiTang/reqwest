@@ -138,3 +138,22 @@ with the enabled feature set passes on macOS arm64, Rust 1.98.1:
 334 tests, four ignored (exit 0); fmt passes (exit 0). Strict all-targets
 clippy exits 101 with the original base's diagnostics, with no suppression or independent
 repair. The W7a patch is carried independently of W4a completion forwarding.
+
+## W17b socket admission across routes
+
+Selective port of e6a5fcdc onto 20a8b818: socket_admission and owning
+transports through direct TCP, native-TLS/rustls, plain forwarding, CONNECT
+and SOCKS. No pool total, PoolLimit or conditional CompletionSink forwarding.
+The pinned retry opt-out and CONNECT behavior remain. The one refusal
+classifier extracts the original connector failure through SOCKS and stops
+local-target fallback/retry, including timeout-wrapped attempts; unmarked
+native DNS/connect errors retain upstream fallback. The local-target DNS
+iterator now stays alive through candidate use rather than being consumed
+while making target strings.
+
+Compared upstream de553734 connect/retry ownership and the current pin:
+failed/cancelled dials and TLS handshakes still dispose their native IO;
+OwnedTransport follows successful extraction so adapter/request/pool entry
+destruction cannot return a live socket's admission. No retry or timeout
+policy is added. Regression port tests/socket_ownership.rs; this port's test
+execution is pending. Boundless covers account/DNS route effects.

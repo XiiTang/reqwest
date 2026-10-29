@@ -442,6 +442,16 @@ impl ClientBuilder {
         self.with_inner(|inner| inner.pool_idle_timeout(val))
     }
 
+    /// Set TCP socket-opener admission and its transport lifetime guard.
+    ///
+    /// Default is `None`. See [`crate::ClientBuilder::socket_admission`].
+    pub fn socket_admission(
+        self,
+        admission: Option<hyper_util::client::legacy::connect::SocketAdmission>,
+    ) -> ClientBuilder {
+        self.with_inner(move |inner| inner.socket_admission(admission))
+    }
+
     /// Sets the maximum idle connection per host allowed in the pool.
     pub fn pool_max_idle_per_host(self, max: usize) -> ClientBuilder {
         self.with_inner(move |inner| inner.pool_max_idle_per_host(max))

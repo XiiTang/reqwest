@@ -174,6 +174,7 @@ struct Config {
     connection_verbose: bool,
     pool_idle_timeout: Option<Duration>,
     pool_max_idle_per_host: usize,
+    socket_admission: Option<hyper_util::client::legacy::connect::SocketAdmission>,
     tcp_keepalive: Option<Duration>,
     tcp_keepalive_interval: Option<Duration>,
     tcp_keepalive_retries: Option<u32>,
@@ -334,6 +335,7 @@ impl ClientBuilder {
                 connection_verbose: false,
                 pool_idle_timeout: Some(Duration::from_secs(90)),
                 pool_max_idle_per_host: usize::MAX,
+                socket_admission: None,
                 tcp_keepalive: Some(Duration::from_secs(15)),
                 tcp_keepalive_interval: Some(Duration::from_secs(15)),
                 tcp_keepalive_retries: Some(3),
@@ -972,6 +974,7 @@ impl ClientBuilder {
         #[cfg(target_os = "windows")]
         connector_builder.set_windows_named_pipe(config.windows_named_pipe.clone());
         connector_builder.set_dialer(config.dialer.clone());
+        connector_builder.set_socket_admission(config.socket_admission.clone());
 
         let mut builder = hyper_util::client::legacy::Client::builder(config.executor);
         builder.retry_canceled_requests(config.retry_canceled_requests);
@@ -1546,6 +1549,21 @@ impl ClientBuilder {
         D: Into<Option<Duration>>,
     {
         self.config.pool_idle_timeout = val.into();
+        self
+    }
+
+    /// Set admission at each TCP socket opener.
+    ///
+    /// The callback's guard stays with the connected transport through direct,
+    /// TLS, CONNECT and SOCKS paths. Each SOCKS address dial admits separately;
+    /// admission refusal stops fallback. Custom dialers and local transports
+    /// bypass TCP admission and carry their own transport ownership.
+    /// Default is `None`.
+    pub fn socket_admission(
+        mut self,
+        admission: Option<hyper_util::client::legacy::connect::SocketAdmission>,
+    ) -> ClientBuilder {
+        self.config.socket_admission = admission;
         self
     }
 
@@ -2882,6 +2900,7 @@ impl Config {
 
         f.field("accepts", &self.accepts);
         f.field("executor", &self.executor);
+        f.field("socket_admission", &self.socket_admission);
 
         if !self.proxies.is_empty() {
             f.field("proxies", &self.proxies);

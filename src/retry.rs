@@ -13,6 +13,9 @@
 //! retry. Note however that providing a specific retry policy will override
 //! the default, and you will need to explicitly include that behavior.
 //!
+//! Socket-admission refusals are terminal before dispatch and
+//! never enter retry classification, including a custom classifier.
+//!
 //! All policies default to including a retry budget that permits 20% extra
 //! requests to be sent.
 //!
@@ -234,6 +237,11 @@ impl<B> tower::retry::Policy<Req, http::Response<B>, crate::Error> for Policy {
         req: &mut Req,
         result: &mut crate::Result<http::Response<B>>,
     ) -> Option<Self::Future> {
+        if let Err(error) = result {
+            if crate::error::is_admission_refusal(error) {
+                return None;
+            }
+        }
         match self.classifier.classify(req, result) {
             classify::Action::Success => {
                 log::trace!("shouldn't retry!");

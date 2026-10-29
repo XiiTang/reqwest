@@ -31,6 +31,9 @@ use crate::error::{cast_to_internal_error, BoxError};
 use crate::proxy::{Intercepted, Matcher as ProxyMatcher};
 use sealed::{Conn, Unnameable};
 
+#[cfg(any(feature = "socks", feature = "__tls"))]
+type TcpTransport = hyper_util::client::legacy::connect::OwnedTransport<tokio::net::TcpStream>;
+
 pub(crate) type HttpConnector = hyper_util::client::legacy::connect::HttpConnector<DynResolver>;
 
 #[derive(Clone)]
@@ -103,6 +106,7 @@ pub(crate) struct ConnectorBuilder {
     #[cfg(target_os = "windows")]
     windows_named_pipe: Option<Arc<std::ffi::OsStr>>,
     dialer: Option<Dialer>,
+    socket_admission: Option<hyper_util::client::legacy::connect::SocketAdmission>,
 }
 
 impl ConnectorBuilder {
@@ -129,6 +133,7 @@ where {
             #[cfg(target_os = "windows")]
             windows_named_pipe: self.windows_named_pipe,
             dialer: self.dialer,
+            socket_admission: self.socket_admission,
         };
 
         if base_service.dialer.is_some() && !base_service.proxies.is_empty() {
@@ -247,6 +252,7 @@ where {
             #[cfg(target_os = "windows")]
             windows_named_pipe: None,
             dialer: None,
+            socket_admission: None,
         }
     }
 
@@ -361,6 +367,7 @@ where {
             #[cfg(target_os = "windows")]
             windows_named_pipe: None,
             dialer: None,
+            socket_admission: None,
         }
     }
 
@@ -440,6 +447,7 @@ where {
             #[cfg(target_os = "windows")]
             windows_named_pipe: None,
             dialer: None,
+            socket_admission: None,
         }
     }
 
@@ -511,6 +519,13 @@ where {
         self.windows_named_pipe = pipe;
     }
 
+    pub(crate) fn set_socket_admission(
+        &mut self,
+        admission: Option<hyper_util::client::legacy::connect::SocketAdmission>,
+    ) {
+        self.socket_admission = admission;
+    }
+
     pub(crate) fn set_dialer(&mut self, dialer: Option<Dialer>) {
         self.dialer = dialer;
     }
@@ -544,6 +559,7 @@ pub(crate) struct ConnectorService {
     windows_named_pipe: Option<Arc<std::ffi::OsStr>>,
     /// If set, this takes priority over every other transport.
     dialer: Option<Dialer>,
+    socket_admission: Option<hyper_util::client::legacy::connect::SocketAdmission>,
 }
 
 #[derive(Clone)]
@@ -590,7 +606,16 @@ impl ConnectorService {
             Inner::NativeTls(http, tls) => {
                 if dst.scheme() == Some(&Scheme::HTTPS) {
                     let host = dst.host().ok_or("no host in url")?.to_string();
-                    let conn = socks::connect(proxy, dst, dns, &self.resolver, http, self.socks_timeout).await?;
+                    let conn = socks::connect(
+                        proxy,
+                        dst,
+                        dns,
+                        &self.resolver,
+                        http,
+                        self.socks_timeout,
+                        self.socket_admission.clone(),
+                    )
+                    .await?;
                     let conn = TokioIo::new(conn);
                     let conn = TokioIo::new(conn);
                     let tls_connector = tokio_native_tls::TlsConnector::from(tls.clone());
@@ -611,7 +636,16 @@ impl ConnectorService {
 
                     let tls = tls.clone();
                     let host = dst.host().ok_or("no host in url")?.to_string();
-                    let conn = socks::connect(proxy, dst, dns, &self.resolver, http, self.socks_timeout).await?;
+                    let conn = socks::connect(
+                        proxy,
+                        dst,
+                        dns,
+                        &self.resolver,
+                        http,
+                        self.socks_timeout,
+                        self.socket_admission.clone(),
+                    )
+                    .await?;
                     let conn = TokioIo::new(conn);
                     let conn = TokioIo::new(conn);
                     let server_name =
@@ -630,7 +664,16 @@ impl ConnectorService {
             }
             #[cfg(not(feature = "__tls"))]
             Inner::Http(http) => {
-                let conn = socks::connect(proxy, dst, dns, &self.resolver, http, self.socks_timeout).await?;
+                let conn = socks::connect(
+                    proxy,
+                    dst,
+                    dns,
+                    &self.resolver,
+                    http,
+                    self.socks_timeout,
+                    self.socket_admission.clone(),
+                )
+                .await?;
                 return Ok(Conn {
                     inner: self.verbose.wrap(TokioIo::new(conn)),
                     is_proxy: false,
@@ -641,20 +684,29 @@ impl ConnectorService {
 
         let resolver = &self.resolver;
         let http = self.inner.get_http_connector();
-        socks::connect(proxy, dst, dns, resolver, http, self.socks_timeout)
-            .await
-            .map(|tcp| Conn {
-                inner: self.verbose.wrap(TokioIo::new(tcp)),
-                is_proxy: false,
-                tls_info: false,
-            })
-            .map_err(Into::into)
+        socks::connect(
+            proxy,
+            dst,
+            dns,
+            resolver,
+            http,
+            self.socks_timeout,
+            self.socket_admission.clone(),
+        )
+        .await
+        .map(|tcp| Conn {
+            inner: self.verbose.wrap(TokioIo::new(tcp)),
+            is_proxy: false,
+            tls_info: false,
+        })
+        .map_err(Into::into)
     }
 
     async fn connect_with_maybe_proxy(self, dst: Uri, is_proxy: bool) -> Result<Conn, BoxError> {
         match self.inner {
             #[cfg(not(feature = "__tls"))]
-            Inner::Http(mut http) => {
+            Inner::Http(http) => {
+                let mut http = http.with_socket_admission(self.socket_admission.clone());
                 let io = http.call(dst).await?;
                 Ok(Conn {
                     inner: self.verbose.wrap(io),
@@ -674,7 +726,10 @@ impl ConnectorService {
                 }
 
                 let tls_connector = tokio_native_tls::TlsConnector::from(tls.clone());
-                let mut http = hyper_tls::HttpsConnector::from((http, tls_connector));
+                let mut http = hyper_tls::HttpsConnector::from((
+                    http.with_socket_admission(self.socket_admission.clone()),
+                    tls_connector,
+                ));
                 let io = http.call(dst).await?;
 
                 if let hyper_tls::MaybeHttpsStream::Https(stream) = io {
@@ -686,6 +741,7 @@ impl ConnectorService {
                             .get_ref()
                             .inner()
                             .inner()
+                            .get_ref()
                             .set_nodelay(false)?;
                     }
                     Ok(Conn {
@@ -717,13 +773,16 @@ impl ConnectorService {
                     http.set_nodelay(true);
                 }
 
-                let mut http = hyper_rustls::HttpsConnector::from((http, tls.clone()));
+                let mut http = hyper_rustls::HttpsConnector::from((
+                    http.with_socket_admission(self.socket_admission.clone()),
+                    tls.clone(),
+                ));
                 let io = http.call(dst).await?;
 
                 if let hyper_rustls::MaybeHttpsStream::Https(stream) = io {
                     if !self.nodelay {
                         let (io, _) = stream.inner().get_ref();
-                        io.inner().inner().set_nodelay(false)?;
+                        io.inner().inner().get_ref().set_nodelay(false)?;
                     }
                     Ok(Conn {
                         inner: self.verbose.wrap(RustlsTlsConn { inner: stream }),
@@ -829,7 +888,10 @@ impl ConnectorService {
     /// Connect over the byte stream a caller's dialer opens, with the same TLS
     /// and HTTP as a TCP connection.
     async fn connect_dialed(self, dst: Uri) -> Result<Conn, BoxError> {
-        let dialer = self.dialer.clone().expect("connect dialed must have a dialer");
+        let dialer = self
+            .dialer
+            .clone()
+            .expect("connect dialed must have a dialer");
         let svc = tower::service_fn(move |dst: Uri| {
             let dialing = (dialer.0)(dst);
             async move { dialing.await.map(TokioIo::new) }
@@ -912,8 +974,11 @@ impl ConnectorService {
                 if dst.scheme() == Some(&Scheme::HTTPS) {
                     log::trace!("tunneling HTTPS over proxy");
                     let tls_connector = tokio_native_tls::TlsConnector::from(tls.clone());
-                    let inner =
-                        hyper_tls::HttpsConnector::from((http.clone(), tls_connector.clone()));
+                    let inner = hyper_tls::HttpsConnector::from((
+                        http.clone()
+                            .with_socket_admission(self.socket_admission.clone()),
+                        tls_connector.clone(),
+                    ));
                     // TODO: we could cache constructing this
                     let mut tunnel =
                         hyper_util::client::legacy::connect::proxy::Tunnel::new(proxy_dst, inner);
@@ -957,7 +1022,9 @@ impl ConnectorService {
                     use tokio_rustls::TlsConnector as RustlsConnector;
 
                     log::trace!("tunneling HTTPS over proxy");
-                    let http = http.clone();
+                    let http = http
+                        .clone()
+                        .with_socket_admission(self.socket_admission.clone());
                     let inner = hyper_rustls::HttpsConnector::from((http, tls_proxy.clone()));
                     // TODO: we could cache constructing this
                     let mut tunnel =
@@ -1082,14 +1149,14 @@ impl<T: TlsInfoFactory> TlsInfoFactory for TokioIo<T> {
 // ===== TcpStream =====
 
 #[cfg(feature = "__tls")]
-impl TlsInfoFactory for tokio::net::TcpStream {
+impl TlsInfoFactory for TcpTransport {
     fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
         None
     }
 }
 
 #[cfg(feature = "__native-tls")]
-impl TlsInfoFactory for tokio_native_tls::TlsStream<TokioIo<TokioIo<tokio::net::TcpStream>>> {
+impl TlsInfoFactory for tokio_native_tls::TlsStream<TokioIo<TokioIo<TcpTransport>>> {
     fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
         let peer_certificate = self
             .get_ref()
@@ -1103,9 +1170,7 @@ impl TlsInfoFactory for tokio_native_tls::TlsStream<TokioIo<TokioIo<tokio::net::
 
 #[cfg(feature = "__native-tls")]
 impl TlsInfoFactory
-    for tokio_native_tls::TlsStream<
-        TokioIo<hyper_tls::MaybeHttpsStream<TokioIo<tokio::net::TcpStream>>>,
-    >
+    for tokio_native_tls::TlsStream<TokioIo<hyper_tls::MaybeHttpsStream<TokioIo<TcpTransport>>>>
 {
     fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
         let peer_certificate = self
@@ -1119,7 +1184,7 @@ impl TlsInfoFactory
 }
 
 #[cfg(feature = "__native-tls")]
-impl TlsInfoFactory for hyper_tls::MaybeHttpsStream<TokioIo<tokio::net::TcpStream>> {
+impl TlsInfoFactory for hyper_tls::MaybeHttpsStream<TokioIo<TcpTransport>> {
     fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
         match self {
             hyper_tls::MaybeHttpsStream::Https(tls) => tls.tls_info(),
@@ -1129,7 +1194,7 @@ impl TlsInfoFactory for hyper_tls::MaybeHttpsStream<TokioIo<tokio::net::TcpStrea
 }
 
 #[cfg(feature = "__rustls")]
-impl TlsInfoFactory for tokio_rustls::client::TlsStream<TokioIo<TokioIo<tokio::net::TcpStream>>> {
+impl TlsInfoFactory for tokio_rustls::client::TlsStream<TokioIo<TokioIo<TcpTransport>>> {
     fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
         let peer_certificate = self
             .get_ref()
@@ -1144,7 +1209,7 @@ impl TlsInfoFactory for tokio_rustls::client::TlsStream<TokioIo<TokioIo<tokio::n
 #[cfg(feature = "__rustls")]
 impl TlsInfoFactory
     for tokio_rustls::client::TlsStream<
-        TokioIo<hyper_rustls::MaybeHttpsStream<TokioIo<tokio::net::TcpStream>>>,
+        TokioIo<hyper_rustls::MaybeHttpsStream<TokioIo<TcpTransport>>>,
     >
 {
     fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
@@ -1159,7 +1224,7 @@ impl TlsInfoFactory
 }
 
 #[cfg(feature = "__rustls")]
-impl TlsInfoFactory for hyper_rustls::MaybeHttpsStream<TokioIo<tokio::net::TcpStream>> {
+impl TlsInfoFactory for hyper_rustls::MaybeHttpsStream<TokioIo<TcpTransport>> {
     fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
         match self {
             hyper_rustls::MaybeHttpsStream::Https(tls) => tls.tls_info(),
@@ -1684,6 +1749,7 @@ pub(crate) type Connecting = Pin<Box<dyn Future<Output = Result<Conn, BoxError>>
 
 #[cfg(feature = "__native-tls")]
 mod native_tls_conn {
+    use super::TcpTransport as TcpStream;
     use super::TlsInfoFactory;
     use hyper::rt::{Read, ReadBufCursor, Write};
     use hyper_tls::MaybeHttpsStream;
@@ -1696,7 +1762,6 @@ mod native_tls_conn {
         task::{Context, Poll},
     };
     use tokio::io::{AsyncRead, AsyncWrite};
-    use tokio::net::TcpStream;
     use tokio_native_tls::TlsStream;
 
     pin_project! {
@@ -1883,6 +1948,7 @@ mod native_tls_conn {
 
 #[cfg(feature = "__rustls")]
 mod rustls_tls_conn {
+    use super::TcpTransport as TcpStream;
     use super::TlsInfoFactory;
     use hyper::rt::{Read, ReadBufCursor, Write};
     use hyper_rustls::MaybeHttpsStream;
@@ -1895,7 +1961,6 @@ mod rustls_tls_conn {
         task::{Context, Poll},
     };
     use tokio::io::{AsyncRead, AsyncWrite};
-    use tokio::net::TcpStream;
     use tokio_rustls::client::TlsStream;
 
     pin_project! {
@@ -2089,10 +2154,10 @@ mod rustls_tls_conn {
 mod socks {
     use tower_service::Service;
 
+    use super::TcpTransport as TcpStream;
     use http::uri::Scheme;
     use http::Uri;
     use hyper_util::client::legacy::connect::proxy::{SocksV4, SocksV5};
-    use tokio::net::TcpStream;
 
     use super::BoxError;
     use crate::proxy::Intercepted;
@@ -2116,24 +2181,42 @@ mod socks {
         resolver: &crate::dns::DynResolver,
         http_connector: &mut crate::connect::HttpConnector,
         timeout: Option<std::time::Duration>,
+        admission: Option<hyper_util::client::legacy::connect::SocketAdmission>,
     ) -> Result<TcpStream, SocksProxyError> {
         let started = tokio::time::Instant::now();
         let https = dst.scheme() == Some(&Scheme::HTTPS);
         let original_host = dst.host().ok_or(SocksProxyError::SocksNoHostInUrl)?;
         let port = dst.port_u16().unwrap_or(if https { 443 } else { 80 });
+        let mut resolved;
         let targets = match dns_mode {
             DnsResolve::Proxy => vec![original_host.to_owned()],
             DnsResolve::Local => {
                 let mut targets = Vec::new();
-                for address in resolver.http_resolve(&dst).await.map_err(SocksProxyError::SocksLocalResolve)? {
+                resolved = resolver
+                    .http_resolve(&dst)
+                    .await
+                    .map_err(SocksProxyError::SocksLocalResolve)?;
+                for address in resolved.by_ref() {
                     if proxy.uri().scheme_str() == Some("socks4") && address.is_ipv6() {
                         continue;
                     }
-                    let host = if address.is_ipv6() { format!("[{}]", address.ip()) } else { address.ip().to_string() };
-                    if !targets.contains(&host) { targets.push(host); }
+                    let host = if address.is_ipv6() {
+                        format!("[{}]", address.ip())
+                    } else {
+                        address.ip().to_string()
+                    };
+                    if !targets.contains(&host) {
+                        targets.push(host);
+                    }
                 }
                 if targets.is_empty() {
-                    return Err(SocksProxyError::SocksLocalResolve(std::io::Error::new(std::io::ErrorKind::NotFound, "SOCKS local DNS returned no supported addresses").into()));
+                    return Err(SocksProxyError::SocksLocalResolve(
+                        std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            "SOCKS local DNS returned no supported addresses",
+                        )
+                        .into(),
+                    ));
                 }
                 targets
             }
@@ -2143,20 +2226,47 @@ mod socks {
         for (index, host) in targets.into_iter().enumerate() {
             // Only a configured timeout is shared among the addresses; without
             // one, an attempt has no bound of its own.
-            let budget = timeout.map(|limit| limit.saturating_sub(started.elapsed()) / (count - index) as u32);
-            let uri = format!("{}://{}:{}", if https { "https" } else { "http" }, host, port)
-                .parse::<Uri>().map_err(|e| SocksProxyError::SocksConnect(e.into()))?;
-            if count == 1 { return connect_target(&proxy, uri, http_connector).await; }
+            let budget = timeout
+                .map(|limit| limit.saturating_sub(started.elapsed()) / (count - index) as u32);
+            let uri = format!(
+                "{}://{}:{}",
+                if https { "https" } else { "http" },
+                host,
+                port
+            )
+            .parse::<Uri>()
+            .map_err(|e| SocksProxyError::SocksConnect(e.into()))?;
+            if count == 1 {
+                return connect_target(&proxy, uri, http_connector, admission.clone()).await;
+            }
             let Some(budget) = budget else {
-                match connect_target(&proxy, uri, http_connector).await {
+                match connect_target(&proxy, uri, http_connector, admission.clone()).await {
                     Ok(stream) => return Ok(stream),
-                    Err(error) => { last = Some(error); continue; }
+                    Err(error) if crate::error::is_admission_refusal(&error) => return Err(error),
+                    Err(error) => {
+                        last = Some(error);
+                        continue;
+                    }
                 }
             };
-            match tokio::time::timeout(budget, connect_target(&proxy, uri, http_connector)).await {
+            match tokio::time::timeout(
+                budget,
+                connect_target(&proxy, uri, http_connector, admission.clone()),
+            )
+            .await
+            {
                 Ok(Ok(stream)) => return Ok(stream),
+                Ok(Err(error)) if crate::error::is_admission_refusal(&error) => return Err(error),
                 Ok(Err(error)) => last = Some(error),
-                Err(_) => last = Some(SocksProxyError::SocksConnect(std::io::Error::new(std::io::ErrorKind::TimedOut, "SOCKS address attempt timed out").into())),
+                Err(_) => {
+                    last = Some(SocksProxyError::SocksConnect(
+                        std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "SOCKS address attempt timed out",
+                        )
+                        .into(),
+                    ))
+                }
             }
         }
         Err(last.expect("nonempty SOCKS target list"))
@@ -2166,26 +2276,48 @@ mod socks {
         proxy: &Intercepted,
         dst_uri: Uri,
         http_connector: &mut crate::connect::HttpConnector,
+        admission: Option<hyper_util::client::legacy::connect::SocketAdmission>,
     ) -> Result<TcpStream, SocksProxyError> {
+        let mut connector = http_connector.clone().with_socket_admission(admission);
         // TODO: can `Scheme::from_static()` be const fn, compare with a SOCKS5 constant?
         match proxy.uri().scheme_str() {
             Some("socks4") | Some("socks4a") => {
-                let mut svc = SocksV4::new(proxy.uri().clone(), http_connector);
-                let stream = Service::call(&mut svc, dst_uri)
-                    .await
-                    .map_err(|e| SocksProxyError::SocksConnect(e.into()))?;
+                let mut svc = SocksV4::new(proxy.uri().clone(), &mut connector);
+                let stream = Service::call(&mut svc, dst_uri).await.map_err(|error| {
+                    if error
+                        .connection_error()
+                        .is_some_and(|error| crate::error::is_admission_refusal(error))
+                    {
+                        match error.into_connection_error() {
+                            Ok(cause) => SocksProxyError::SocksConnect(cause.into()),
+                            Err(error) => SocksProxyError::SocksConnect(error.into()),
+                        }
+                    } else {
+                        SocksProxyError::SocksConnect(error.into())
+                    }
+                })?;
                 Ok(stream.into_inner())
             }
             Some("socks5") | Some("socks5h") => {
                 let mut svc = if let Some((username, password)) = proxy.raw_auth() {
-                    SocksV5::new(proxy.uri().clone(), http_connector)
+                    SocksV5::new(proxy.uri().clone(), &mut connector)
                         .with_auth(username.to_string(), password.to_string())
                 } else {
-                    SocksV5::new(proxy.uri().clone(), http_connector)
+                    SocksV5::new(proxy.uri().clone(), &mut connector)
                 };
-                let stream = Service::call(&mut svc, dst_uri)
-                    .await
-                    .map_err(|e| SocksProxyError::SocksConnect(e.into()))?;
+                let stream = Service::call(&mut svc, dst_uri).await.map_err(|error| {
+                    if error
+                        .connection_error()
+                        .is_some_and(|error| crate::error::is_admission_refusal(error))
+                    {
+                        match error.into_connection_error() {
+                            Ok(cause) => SocksProxyError::SocksConnect(cause.into()),
+                            Err(error) => SocksProxyError::SocksConnect(error.into()),
+                        }
+                    } else {
+                        SocksProxyError::SocksConnect(error.into())
+                    }
+                })?;
                 Ok(stream.into_inner())
             }
             _ => unreachable!(),

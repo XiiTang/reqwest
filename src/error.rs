@@ -415,6 +415,21 @@ impl fmt::Display for BadScheme {
 
 impl StdError for BadScheme {}
 
+// Admission failures are terminal before dispatch, even with a custom retry
+// classifier or another address available in a route adapter.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn is_admission_refusal(error: &(dyn StdError + 'static)) -> bool {
+    let mut source = Some(error);
+    while let Some(error) = source {
+        if error.is::<hyper_util::client::legacy::connect::SocketAdmissionRefused>()
+        {
+            return true;
+        }
+        source = error.source();
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -474,19 +489,4 @@ mod tests {
         let nested = super::request(io);
         assert!(nested.is_timeout());
     }
-}
-
-// Admission failures are terminal before dispatch, even with a custom retry
-// classifier or another address available in a route adapter.
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn is_admission_refusal(error: &(dyn StdError + 'static)) -> bool {
-    let mut source = Some(error);
-    while let Some(error) = source {
-        if error.is::<hyper_util::client::legacy::connect::SocketAdmissionRefused>()
-        {
-            return true;
-        }
-        source = error.source();
-    }
-    false
 }

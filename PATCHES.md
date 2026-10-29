@@ -165,6 +165,7 @@ per-attempt admission, terminal refusal/custom retry, and a supplied channel
 dialer. Strict library/tests Clippy exits 101 (21 library and 25 library-test
 diagnostics): existing cfg/attribute style, constructor argument counts,
 large enums, old io::Error constructors, lifetimes, cloning/copy and test style.
-The cited constructor signatures, one-condition cfg and diagnostic expressions
-are present at base 20a8b818; no diagnostic names the added socket custody or
-admission classifier. No unrelated repair or lint suppression is included.
+The initial test-target diagnostics included the port's classifier after the
+existing test module; it is now placed before that module. The remaining
+constructor signatures, one-condition cfg and diagnostic expressions are
+present at base 20a8b818. No unrelated repair or lint suppression is included.

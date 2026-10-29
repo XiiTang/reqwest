@@ -421,8 +421,7 @@ impl StdError for BadScheme {}
 pub(crate) fn is_admission_refusal(error: &(dyn StdError + 'static)) -> bool {
     let mut source = Some(error);
     while let Some(error) = source {
-        if error.is::<hyper_util::client::legacy::connect::SocketAdmissionRefused>()
-        {
+        if error.is::<hyper_util::client::legacy::connect::SocketAdmissionRefused>() {
             return true;
         }
         source = error.source();

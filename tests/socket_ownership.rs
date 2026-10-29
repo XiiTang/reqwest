@@ -1,6 +1,6 @@
 #![cfg(all(not(target_arch = "wasm32"), feature = "socks", feature = "__rustls"))]
-use hyper_util::client::legacy::{
-    connect::{OwnedTransport, SocketAdmission, SocketAdmissionRefused},
+use hyper_util::client::legacy::connect::{
+    OwnedTransport, SocketAdmission, SocketAdmissionRefused,
 };
 use std::{
     cell::Cell,

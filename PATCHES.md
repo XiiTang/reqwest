@@ -157,3 +157,14 @@ OwnedTransport follows successful extraction so adapter/request/pool entry
 destruction cannot return a live socket's admission. No retry or timeout
 policy is added. Regression port tests/socket_ownership.rs; this port's test
 execution is pending. Boundless covers account/DNS route effects.
+
+W17b port validation on macOS arm64 with consumer Rust 1.97.0 and matching
+hyper-util/hyper/h2: all four socket-ownership tests pass (exit 0), covering
+direct/native-TLS/rustls, plain/TLS proxies, CONNECT, SOCKS extraction and
+per-attempt admission, terminal refusal/custom retry, and a supplied channel
+dialer. Strict library/tests Clippy exits 101 (21 library and 25 library-test
+diagnostics): existing cfg/attribute style, constructor argument counts,
+large enums, old io::Error constructors, lifetimes, cloning/copy and test style.
+The cited constructor signatures, one-condition cfg and diagnostic expressions
+are present at base 20a8b818; no diagnostic names the added socket custody or
+admission classifier. No unrelated repair or lint suppression is included.

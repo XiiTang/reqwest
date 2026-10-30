@@ -263,7 +263,7 @@ mod tests {
             })
         }
     }
-    fn find<T: Error + 'static>(error: &(dyn Error + 'static)) -> Option<&T> {
+    fn find<'a, T: Error + 'static>(error: &'a (dyn Error + 'static)) -> Option<&'a T> {
         error
             .downcast_ref()
             .or_else(|| {

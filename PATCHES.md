@@ -185,4 +185,11 @@ Upstream timeout, retry, readiness, connection disposal and pooling actions
 are unchanged; native timer results acquire no pending-phase observation.
 Existing proxy/origin identity/resumption and W17b socket/DNS custody remain.
 
-Regression results are pending the targeted implementation checks.
+Regression evidence on macOS arm64, Rust 1.98.1, through build-slot with consumer patch configuration selecting the pinned hyper/rustls and D8 hyper-util/h2:
+
+- `cargo test -p reqwest --locked --features native-tls,rustls,socks,http2 --config <consumer patches> --lib --test socket_ownership -- connect::error_context::tests:: direct_tls_connect_and_socks socket_refusal_keeps each_socks_address_attempt ssh_style_owned_dialer`: exit 0, seven passed. Both real HTTPS backends preserve lower Ready/Call sources after service destruction, post-CONNECT DNS-name rejection retains its original native error, and the four socket-ownership cases retain transport/channel/DNS admission custody and terminal refusal behavior.
+- `cargo test -p reqwest --locked --no-default-features --features rustls,socks,http2 --config <consumer patches> --test socket_ownership --test socks_addresses --test proxy_tls --test executor --test dialer --test request_target`: exit 0, fourteen passed. This covers proxy/origin identity and resumption separation, exact request path/guard, supplied dialer/executor, local/remote SOCKS DNS and address-attempt timeout behavior. The first combined-backend invocation exited 101 because an unchanged rustls-identity dialer fixture selected the default native backend; the intended rustls configuration above passed without changing that fixture.
+- Strict `cargo clippy -p reqwest --lib --tests --locked --features native-tls,rustls,socks,http2 --config <consumer patches> -- -D warnings`: exit 101, 21 library and 24 library-test baseline diagnostics. Diagnosed cfg/constructor/enum/header-clone expressions and the other reported files are unchanged from 05633b09. No D8 diagnostic, unrelated repair or waiver.
+- `cargo fmt --all --check`: exit 0.
+
+The established proxy TLS adapter wraps the backend result before CONNECT receives bytes, and remains underneath nested origin TLS; forwarding uses the same returned-error context. It changes only actual error results. Boundless's targeted declared-hop, initial/header/trailer, body/readiness and TLS-record effects use the corresponding Git pins. Pre-landing lanes remain the landing owner's gate.

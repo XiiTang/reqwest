@@ -227,3 +227,117 @@ impl<T: super::TlsInfoFactory> super::TlsInfoFactory for AttributedIo<T> {
         self.inner.tls_info()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hyper_util::rt::TokioIo;
+    #[derive(Debug)]
+    struct Lower;
+    impl fmt::Display for Lower {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("typed lower failure")
+        }
+    }
+    impl Error for Lower {}
+    #[derive(Clone)]
+    struct Connector(u8);
+    impl Service<Uri> for Connector {
+        type Response = TokioIo<tokio::io::DuplexStream>;
+        type Error = BoxError;
+        type Future = std::future::Ready<Result<Self::Response, BoxError>>;
+        fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), BoxError>> {
+            Poll::Ready(if self.0 == 0 {
+                Err(io::Error::other(Lower).into())
+            } else {
+                Ok(())
+            })
+        }
+        fn call(&mut self, _: Uri) -> Self::Future {
+            std::future::ready(if self.0 == 1 {
+                Err(io::Error::other(Lower).into())
+            } else {
+                let (client, peer) = tokio::io::duplex(4096);
+                drop(peer);
+                Ok(TokioIo::new(client))
+            })
+        }
+    }
+    fn find<T: Error + 'static>(error: &(dyn Error + 'static)) -> Option<&T> {
+        error
+            .downcast_ref()
+            .or_else(|| {
+                error
+                    .downcast_ref::<io::Error>()
+                    .and_then(io::Error::get_ref)
+                    .and_then(|inner| find(inner))
+            })
+            .or_else(|| error.source().and_then(find))
+    }
+    async fn backend<S>(make: impl Fn(Attributed<Connector>) -> S)
+    where
+        S: Service<Uri, Error = BoxError>,
+        S::Future: Send + 'static,
+        S::Response: 'static,
+    {
+        let proxy: Uri = "https://proxy.test:443".parse().unwrap();
+        for mode in 0..3 {
+            let lower = Attributed::new(Connector(mode), ConnectStage::Dial, Some(proxy.clone()));
+            let mut service =
+                Attributed::new(make(lower), ConnectStage::TlsSetup, Some(proxy.clone()));
+            let result = if mode == 0 {
+                std::future::poll_fn(|cx| service.poll_ready(cx))
+                    .await
+                    .err()
+                    .unwrap()
+            } else {
+                service.call(proxy.clone()).await.err().unwrap()
+            };
+            drop(service);
+            let marker =
+                find::<ConnectError>(&*result).expect("returned context survives destruction");
+            assert_eq!(marker.proxy(), Some(&proxy));
+            if mode < 2 {
+                assert!(matches!(marker.stage(), ConnectStage::Dial));
+                assert!(find::<Lower>(&*result).is_some());
+            } else {
+                assert!(matches!(marker.stage(), ConnectStage::TlsSetup));
+            }
+        }
+    }
+    #[cfg(feature = "__native-tls")]
+    #[tokio::test]
+    async fn native_tls_keeps_lower_ready_call_and_its_own_handshake_errors() {
+        let tls =
+            tokio_native_tls::TlsConnector::from(native_tls_crate::TlsConnector::new().unwrap());
+        backend(|lower| hyper_tls::HttpsConnector::from((lower, tls.clone()))).await;
+    }
+    #[cfg(feature = "__rustls")]
+    #[tokio::test]
+    async fn rustls_keeps_lower_ready_call_and_its_own_handshake_errors() {
+        let tls = std::sync::Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(rustls::RootCertStore::empty())
+                .with_no_client_auth(),
+        );
+        backend(|lower| hyper_rustls::HttpsConnector::from((lower, tls.clone()))).await;
+        let mut service = Attributed::new(
+            hyper_rustls::HttpsConnector::from((
+                Attributed::new(Connector(1), ConnectStage::Dial, None),
+                tls,
+            )),
+            ConnectStage::TlsSetup,
+            None,
+        );
+        let error = service
+            .call("https://invalid_name/".parse().unwrap())
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(
+            find::<ConnectError>(&*error).unwrap().stage(),
+            ConnectStage::TlsSetup
+        ));
+        assert!(find::<Lower>(&*error).is_none());
+    }
+}

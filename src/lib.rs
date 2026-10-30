@@ -373,6 +373,7 @@ if_hyper! {
     #[cfg(feature = "blocking")]
     pub mod blocking;
     mod connect;
+    pub use connect::{ConnectError, ConnectStage};
     #[cfg(feature = "cookies")]
     pub mod cookie;
     pub mod dns;

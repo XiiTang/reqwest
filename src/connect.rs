@@ -31,6 +31,11 @@ use crate::error::{cast_to_internal_error, BoxError};
 use crate::proxy::{Intercepted, Matcher as ProxyMatcher};
 use sealed::{Conn, Unnameable};
 
+#[path = "connect_error.rs"]
+mod error_context;
+use error_context::{Attributed, AttributedIo};
+pub use error_context::{ConnectError, ConnectStage};
+
 #[cfg(any(feature = "socks", feature = "__tls"))]
 type TcpTransport = hyper_util::client::legacy::connect::OwnedTransport<tokio::net::TcpStream>;
 
@@ -593,6 +598,15 @@ impl Inner {
 impl ConnectorService {
     #[cfg(feature = "socks")]
     async fn connect_socks(mut self, dst: Uri, proxy: Intercepted) -> Result<Conn, BoxError> {
+        let proxy_uri = proxy.uri().clone();
+        let attribute = |error: socks::SocksProxyError| {
+            let (stage, proxy) = if matches!(error, socks::SocksProxyError::SocksLocalResolve(_)) {
+                (ConnectStage::TargetDns, None)
+            } else {
+                (ConnectStage::Socks, Some(proxy_uri.clone()))
+            };
+            ConnectError::wrap(stage, proxy, error.into())
+        };
         let dns = match proxy.uri().scheme_str() {
             Some("socks4") | Some("socks5") => socks::DnsResolve::Local,
             Some("socks4a") | Some("socks5h") => socks::DnsResolve::Proxy,
@@ -615,11 +629,14 @@ impl ConnectorService {
                         self.socks_timeout,
                         self.socket_admission.clone(),
                     )
-                    .await?;
+                    .await
+                    .map_err(&attribute)?;
                     let conn = TokioIo::new(conn);
                     let conn = TokioIo::new(conn);
                     let tls_connector = tokio_native_tls::TlsConnector::from(tls.clone());
-                    let io = tls_connector.connect(&host, conn).await?;
+                    let io = tls_connector.connect(&host, conn).await.map_err(|error| {
+                        ConnectError::wrap(ConnectStage::TlsSetup, None, error.into())
+                    })?;
                     let io = TokioIo::new(io);
                     return Ok(Conn {
                         inner: self.verbose.wrap(NativeTlsConn { inner: io }),
@@ -645,15 +662,26 @@ impl ConnectorService {
                         self.socks_timeout,
                         self.socket_admission.clone(),
                     )
-                    .await?;
+                    .await
+                    .map_err(&attribute)?;
                     let conn = TokioIo::new(conn);
                     let conn = TokioIo::new(conn);
-                    let server_name =
-                        rustls_pki_types::ServerName::try_from(host.as_str().to_owned())
-                            .map_err(|_| "Invalid Server Name")?;
+                    let server_name = rustls_pki_types::ServerName::try_from(
+                        host.as_str().to_owned(),
+                    )
+                    .map_err(|_| {
+                        ConnectError::wrap(
+                            ConnectStage::TlsSetup,
+                            None,
+                            "Invalid Server Name".into(),
+                        )
+                    })?;
                     let io = RustlsConnector::from(tls)
                         .connect(server_name, conn)
-                        .await?;
+                        .await
+                        .map_err(|error| {
+                            ConnectError::wrap(ConnectStage::TlsSetup, None, error.into())
+                        })?;
                     let io = TokioIo::new(io);
                     return Ok(Conn {
                         inner: self.verbose.wrap(RustlsTlsConn { inner: io }),
@@ -673,7 +701,8 @@ impl ConnectorService {
                     self.socks_timeout,
                     self.socket_admission.clone(),
                 )
-                .await?;
+                .await
+                .map_err(&attribute)?;
                 return Ok(Conn {
                     inner: self.verbose.wrap(TokioIo::new(conn)),
                     is_proxy: false,
@@ -699,15 +728,18 @@ impl ConnectorService {
             is_proxy: false,
             tls_info: false,
         })
-        .map_err(Into::into)
+        .map_err(attribute)
     }
 
     async fn connect_with_maybe_proxy(self, dst: Uri, is_proxy: bool) -> Result<Conn, BoxError> {
+        let proxy = is_proxy.then(|| dst.clone());
         match self.inner {
             #[cfg(not(feature = "__tls"))]
             Inner::Http(http) => {
                 let mut http = http.with_socket_admission(self.socket_admission.clone());
-                let io = http.call(dst).await?;
+                let io = http.call(dst).await.map_err(|error| {
+                    ConnectError::wrap(ConnectStage::Dial, proxy.clone(), error.into())
+                })?;
                 Ok(Conn {
                     inner: self.verbose.wrap(io),
                     is_proxy,
@@ -727,9 +759,14 @@ impl ConnectorService {
 
                 let tls_connector = tokio_native_tls::TlsConnector::from(tls.clone());
                 let mut http = hyper_tls::HttpsConnector::from((
-                    http.with_socket_admission(self.socket_admission.clone()),
+                    Attributed::new(
+                        http.with_socket_admission(self.socket_admission.clone()),
+                        ConnectStage::Dial,
+                        proxy.clone(),
+                    ),
                     tls_connector,
                 ));
+                let mut http = Attributed::new(http, ConnectStage::TlsSetup, proxy.clone());
                 let io = http.call(dst).await?;
 
                 if let hyper_tls::MaybeHttpsStream::Https(stream) = io {
@@ -745,7 +782,11 @@ impl ConnectorService {
                             .set_nodelay(false)?;
                     }
                     Ok(Conn {
-                        inner: self.verbose.wrap(NativeTlsConn { inner: stream }),
+                        inner: self.verbose.wrap(AttributedIo::new(
+                            NativeTlsConn { inner: stream },
+                            proxy.clone(),
+                            true,
+                        )),
                         is_proxy,
                         tls_info: self.tls_info,
                     })
@@ -774,9 +815,14 @@ impl ConnectorService {
                 }
 
                 let mut http = hyper_rustls::HttpsConnector::from((
-                    http.with_socket_admission(self.socket_admission.clone()),
+                    Attributed::new(
+                        http.with_socket_admission(self.socket_admission.clone()),
+                        ConnectStage::Dial,
+                        proxy.clone(),
+                    ),
                     tls.clone(),
                 ));
+                let mut http = Attributed::new(http, ConnectStage::TlsSetup, proxy.clone());
                 let io = http.call(dst).await?;
 
                 if let hyper_rustls::MaybeHttpsStream::Https(stream) = io {
@@ -785,7 +831,11 @@ impl ConnectorService {
                         io.inner().inner().get_ref().set_nodelay(false)?;
                     }
                     Ok(Conn {
-                        inner: self.verbose.wrap(RustlsTlsConn { inner: stream }),
+                        inner: self.verbose.wrap(AttributedIo::new(
+                            RustlsTlsConn { inner: stream },
+                            proxy.clone(),
+                            true,
+                        )),
                         is_proxy,
                         tls_info: self.tls_info,
                     })
@@ -911,7 +961,11 @@ impl ConnectorService {
             #[cfg(feature = "__native-tls")]
             Inner::NativeTls(_, tls) => {
                 let tls_connector = tokio_native_tls::TlsConnector::from(tls.clone());
-                let mut http = hyper_tls::HttpsConnector::from((svc, tls_connector));
+                let mut http = hyper_tls::HttpsConnector::from((
+                    Attributed::new(svc, ConnectStage::Dial, None),
+                    tls_connector,
+                ));
+                let mut http = Attributed::new(http, ConnectStage::TlsSetup, None);
                 let io = http.call(dst).await?;
 
                 if let hyper_tls::MaybeHttpsStream::Https(stream) = io {
@@ -930,7 +984,11 @@ impl ConnectorService {
             }
             #[cfg(feature = "__rustls")]
             Inner::RustlsTls { tls, .. } => {
-                let mut http = hyper_rustls::HttpsConnector::from((svc, tls.clone()));
+                let mut http = hyper_rustls::HttpsConnector::from((
+                    Attributed::new(svc, ConnectStage::Dial, None),
+                    tls.clone(),
+                ));
+                let mut http = Attributed::new(http, ConnectStage::TlsSetup, None);
                 let io = http.call(dst).await?;
 
                 if let hyper_rustls::MaybeHttpsStream::Https(stream) = io {
@@ -975,13 +1033,21 @@ impl ConnectorService {
                     log::trace!("tunneling HTTPS over proxy");
                     let tls_connector = tokio_native_tls::TlsConnector::from(tls.clone());
                     let inner = hyper_tls::HttpsConnector::from((
-                        http.clone()
-                            .with_socket_admission(self.socket_admission.clone()),
+                        Attributed::new(
+                            http.clone()
+                                .with_socket_admission(self.socket_admission.clone()),
+                            ConnectStage::Dial,
+                            Some(proxy_dst.clone()),
+                        ),
                         tls_connector.clone(),
                     ));
+                    let inner =
+                        Attributed::new(inner, ConnectStage::TlsSetup, Some(proxy_dst.clone()));
                     // TODO: we could cache constructing this
-                    let mut tunnel =
-                        hyper_util::client::legacy::connect::proxy::Tunnel::new(proxy_dst, inner);
+                    let mut tunnel = hyper_util::client::legacy::connect::proxy::Tunnel::new(
+                        proxy_dst.clone(),
+                        inner,
+                    );
                     if let Some(auth) = auth {
                         tunnel = tunnel.with_auth(auth);
                     }
@@ -996,11 +1062,25 @@ impl ConnectorService {
                     }
                     // We don't wrap this again in an HttpsConnector since that uses Maybe,
                     // and we know this is definitely HTTPS.
-                    let tunneled = tunnel.call(dst.clone()).await?;
+                    let tunneled = tunnel.call(dst.clone()).await.map_err(|error| {
+                        ConnectError::wrap(
+                            ConnectStage::HttpConnect,
+                            Some(proxy_dst.clone()),
+                            error.into(),
+                        )
+                    })?;
+                    let tunneled = AttributedIo::new(
+                        tunneled,
+                        Some(proxy_dst.clone()),
+                        proxy_dst.scheme() == Some(&Scheme::HTTPS),
+                    );
                     let tls_connector = tokio_native_tls::TlsConnector::from(tls.clone());
                     let io = tls_connector
                         .connect(dst.host().ok_or("no host in url")?, TokioIo::new(tunneled))
-                        .await?;
+                        .await
+                        .map_err(|error| {
+                            ConnectError::wrap(ConnectStage::TlsSetup, None, error.into())
+                        })?;
                     return Ok(Conn {
                         inner: self.verbose.wrap(NativeTlsConn {
                             inner: TokioIo::new(io),
@@ -1025,10 +1105,17 @@ impl ConnectorService {
                     let http = http
                         .clone()
                         .with_socket_admission(self.socket_admission.clone());
-                    let inner = hyper_rustls::HttpsConnector::from((http, tls_proxy.clone()));
+                    let inner = hyper_rustls::HttpsConnector::from((
+                        Attributed::new(http, ConnectStage::Dial, Some(proxy_dst.clone())),
+                        tls_proxy.clone(),
+                    ));
+                    let inner =
+                        Attributed::new(inner, ConnectStage::TlsSetup, Some(proxy_dst.clone()));
                     // TODO: we could cache constructing this
-                    let mut tunnel =
-                        hyper_util::client::legacy::connect::proxy::Tunnel::new(proxy_dst, inner);
+                    let mut tunnel = hyper_util::client::legacy::connect::proxy::Tunnel::new(
+                        proxy_dst.clone(),
+                        inner,
+                    );
                     if let Some(auth) = auth {
                         tunnel = tunnel.with_auth(auth);
                     }
@@ -1042,13 +1129,33 @@ impl ConnectorService {
                     }
                     // We don't wrap this again in an HttpsConnector since that uses Maybe,
                     // and we know this is definitely HTTPS.
-                    let tunneled = tunnel.call(dst.clone()).await?;
+                    let tunneled = tunnel.call(dst.clone()).await.map_err(|error| {
+                        ConnectError::wrap(
+                            ConnectStage::HttpConnect,
+                            Some(proxy_dst.clone()),
+                            error.into(),
+                        )
+                    })?;
+                    let tunneled = AttributedIo::new(
+                        tunneled,
+                        Some(proxy_dst.clone()),
+                        proxy_dst.scheme() == Some(&Scheme::HTTPS),
+                    );
                     let host = dst.host().ok_or("no host in url")?.to_string();
-                    let server_name = ServerName::try_from(host.as_str().to_owned())
-                        .map_err(|_| "Invalid Server Name")?;
+                    let server_name =
+                        ServerName::try_from(host.as_str().to_owned()).map_err(|_| {
+                            ConnectError::wrap(
+                                ConnectStage::TlsSetup,
+                                None,
+                                "Invalid Server Name".into(),
+                            )
+                        })?;
                     let io = RustlsConnector::from(tls.clone())
                         .connect(server_name, TokioIo::new(tunneled))
-                        .await?;
+                        .await
+                        .map_err(|error| {
+                            ConnectError::wrap(ConnectStage::TlsSetup, None, error.into())
+                        })?;
 
                     return Ok(Conn {
                         inner: self.verbose.wrap(RustlsTlsConn {
@@ -1230,6 +1337,33 @@ impl TlsInfoFactory for hyper_rustls::MaybeHttpsStream<TokioIo<TcpTransport>> {
             hyper_rustls::MaybeHttpsStream::Https(tls) => tls.tls_info(),
             hyper_rustls::MaybeHttpsStream::Http(_) => None,
         }
+    }
+}
+
+#[cfg(feature = "__native-tls")]
+impl<T: Read + Write + Unpin> TlsInfoFactory
+    for tokio_native_tls::TlsStream<TokioIo<AttributedIo<T>>>
+{
+    fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
+        let peer_certificate = self
+            .get_ref()
+            .peer_certificate()
+            .ok()
+            .flatten()
+            .and_then(|c| c.to_der().ok());
+        Some(crate::tls::TlsInfo { peer_certificate })
+    }
+}
+#[cfg(feature = "__rustls")]
+impl<T> TlsInfoFactory for tokio_rustls::client::TlsStream<TokioIo<AttributedIo<T>>> {
+    fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
+        let peer_certificate = self
+            .get_ref()
+            .1
+            .peer_certificates()
+            .and_then(|c| c.first())
+            .map(|c| c.to_vec());
+        Some(crate::tls::TlsInfo { peer_certificate })
     }
 }
 
@@ -2283,19 +2417,16 @@ mod socks {
         match proxy.uri().scheme_str() {
             Some("socks4") | Some("socks4a") => {
                 let mut svc = SocksV4::new(proxy.uri().clone(), &mut connector);
-                let stream = Service::call(&mut svc, dst_uri).await.map_err(|error| {
-                    if error
-                        .connection_error()
-                        .is_some_and(|error| crate::error::is_admission_refusal(error))
-                    {
-                        match error.into_connection_error() {
-                            Ok(cause) => SocksProxyError::SocksConnect(cause.into()),
-                            Err(error) => SocksProxyError::SocksConnect(error.into()),
-                        }
-                    } else {
-                        SocksProxyError::SocksConnect(error.into())
-                    }
-                })?;
+                let stream = Service::call(&mut svc, dst_uri)
+                    .await
+                    .map_err(|error| match error.into_connection_error() {
+                        Ok(cause) => SocksProxyError::SocksConnect(super::ConnectError::wrap(
+                            super::ConnectStage::Dial,
+                            Some(proxy.uri().clone()),
+                            cause.into(),
+                        )),
+                        Err(error) => SocksProxyError::SocksConnect(error.into()),
+                    })?;
                 Ok(stream.into_inner())
             }
             Some("socks5") | Some("socks5h") => {
@@ -2305,19 +2436,16 @@ mod socks {
                 } else {
                     SocksV5::new(proxy.uri().clone(), &mut connector)
                 };
-                let stream = Service::call(&mut svc, dst_uri).await.map_err(|error| {
-                    if error
-                        .connection_error()
-                        .is_some_and(|error| crate::error::is_admission_refusal(error))
-                    {
-                        match error.into_connection_error() {
-                            Ok(cause) => SocksProxyError::SocksConnect(cause.into()),
-                            Err(error) => SocksProxyError::SocksConnect(error.into()),
-                        }
-                    } else {
-                        SocksProxyError::SocksConnect(error.into())
-                    }
-                })?;
+                let stream = Service::call(&mut svc, dst_uri)
+                    .await
+                    .map_err(|error| match error.into_connection_error() {
+                        Ok(cause) => SocksProxyError::SocksConnect(super::ConnectError::wrap(
+                            super::ConnectStage::Dial,
+                            Some(proxy.uri().clone()),
+                            cause.into(),
+                        )),
+                        Err(error) => SocksProxyError::SocksConnect(error.into()),
+                    })?;
                 Ok(stream.into_inner())
             }
             _ => unreachable!(),

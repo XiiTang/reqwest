@@ -169,3 +169,20 @@ The initial test-target diagnostics included the port's classifier after the
 existing test module; it is now placed before that module. The remaining
 constructor signatures, one-condition cfg and diagnostic expressions are
 present at base 20a8b818. No unrelated repair or lint suppression is included.
+
+
+## W5-D8: returned error and received reply fidelity
+
+Upstream de553734 boxes lower Ready/Call, backend name/handshake and
+CONNECT/SOCKS failures without attribution. Preserve lower errors at the
+HTTPS backend entry, attach immutable returned-stage/proxy context only to
+new backend errors, and retain proxy TLS I/O context before nested origin
+TLS. Apply the same boundary adapter to CONNECT and forwarding on both
+backends; manual origin TLS keeps its origin context. Keep all lower SOCKS
+connector sources through the existing extraction entry. Public ConnectError
+contains only returned facts and owned source, never pending request progress.
+Upstream timeout, retry, readiness, connection disposal and pooling actions
+are unchanged; native timer results acquire no pending-phase observation.
+Existing proxy/origin identity/resumption and W17b socket/DNS custody remain.
+
+Regression results are pending the targeted implementation checks.

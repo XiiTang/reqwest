@@ -1037,6 +1037,14 @@ impl ConnectorService {
                     ));
                     let inner =
                         Attributed::new(inner, ConnectStage::TlsSetup, Some(proxy_dst.clone()));
+                    let proxy_context = proxy_dst.clone();
+                    let inner = tower::ServiceExt::map_response(inner, move |io| {
+                        AttributedIo::new(
+                            io,
+                            Some(proxy_context.clone()),
+                            proxy_context.scheme() == Some(&Scheme::HTTPS),
+                        )
+                    });
                     // TODO: we could cache constructing this
                     let mut tunnel = hyper_util::client::legacy::connect::proxy::Tunnel::new(
                         proxy_dst.clone(),
@@ -1063,11 +1071,6 @@ impl ConnectorService {
                             error.into(),
                         )
                     })?;
-                    let tunneled = AttributedIo::new(
-                        tunneled,
-                        Some(proxy_dst.clone()),
-                        proxy_dst.scheme() == Some(&Scheme::HTTPS),
-                    );
                     let tls_connector = tokio_native_tls::TlsConnector::from(tls.clone());
                     let io = tls_connector
                         .connect(dst.host().ok_or("no host in url")?, TokioIo::new(tunneled))
@@ -1105,6 +1108,14 @@ impl ConnectorService {
                     ));
                     let inner =
                         Attributed::new(inner, ConnectStage::TlsSetup, Some(proxy_dst.clone()));
+                    let proxy_context = proxy_dst.clone();
+                    let inner = tower::ServiceExt::map_response(inner, move |io| {
+                        AttributedIo::new(
+                            io,
+                            Some(proxy_context.clone()),
+                            proxy_context.scheme() == Some(&Scheme::HTTPS),
+                        )
+                    });
                     // TODO: we could cache constructing this
                     let mut tunnel = hyper_util::client::legacy::connect::proxy::Tunnel::new(
                         proxy_dst.clone(),
@@ -1130,11 +1141,6 @@ impl ConnectorService {
                             error.into(),
                         )
                     })?;
-                    let tunneled = AttributedIo::new(
-                        tunneled,
-                        Some(proxy_dst.clone()),
-                        proxy_dst.scheme() == Some(&Scheme::HTTPS),
-                    );
                     let host = dst.host().ok_or("no host in url")?.to_string();
                     let server_name =
                         ServerName::try_from(host.as_str().to_owned()).map_err(|error| {
@@ -1934,7 +1940,6 @@ mod native_tls_conn {
         }
     }
 
-    #[cfg(unix)]
     impl<T: Read + Write + Connection + Unpin> Connection
         for NativeTlsConn<TokioIo<super::AttributedIo<T>>>
     {
@@ -2147,7 +2152,6 @@ mod rustls_tls_conn {
         }
     }
 
-    #[cfg(unix)]
     impl<T: Read + Write + Connection + Unpin> Connection
         for RustlsTlsConn<TokioIo<super::AttributedIo<T>>>
     {

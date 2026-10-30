@@ -350,7 +350,7 @@ mod tests {
             None,
         );
         let error = service
-            .call("https://invalid_name/".parse().unwrap())
+            .call("https://-invalid.test/".parse().unwrap())
             .await
             .err()
             .unwrap();
@@ -372,7 +372,7 @@ mod tests {
             while !request.ends_with(b"\r\n\r\n") {
                 request.push(socket.read_u8().await.unwrap());
             }
-            assert!(request.starts_with(b"CONNECT invalid_name:443 "));
+            assert!(request.starts_with(b"CONNECT -invalid.test:443 "));
             socket.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await.unwrap();
         });
         let tls = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
@@ -388,7 +388,7 @@ mod tests {
             .build()
             .unwrap();
         let error = client
-            .get("https://invalid_name/")
+            .get("https://-invalid.test/")
             .send()
             .await
             .err()

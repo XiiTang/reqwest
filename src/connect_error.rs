@@ -55,7 +55,16 @@ impl ConnectError {
                     .is_some_and(|inner| attributed(inner))
                 || error.source().is_some_and(attributed)
         }
-        if attributed(&*source) {
+        fn timer(error: &(dyn Error + 'static)) -> bool {
+            error.is::<crate::error::TimedOut>()
+                || error.is::<tokio::time::error::Elapsed>()
+                || error.downcast_ref::<io::Error>().is_some_and(|io| {
+                    io.kind() == io::ErrorKind::TimedOut && io.raw_os_error().is_none()
+                })
+                || error.source().is_some_and(timer)
+        }
+        // Native timers answer their own expiry, not a failed pending phase.
+        if attributed(&*source) || timer(&*source) {
             source
         } else {
             Box::new(Self {

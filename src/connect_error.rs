@@ -63,8 +63,13 @@ impl ConnectError {
                 })
                 || error.source().is_some_and(timer)
         }
+        fn has_os(error: &(dyn Error + 'static)) -> bool {
+            error.downcast_ref::<io::Error>().is_some_and(|io| {
+                io.raw_os_error().is_some() || io.get_ref().is_some_and(|inner| has_os(inner))
+            }) || error.source().is_some_and(has_os)
+        }
         // Native timers answer their own expiry, not a failed pending phase.
-        if attributed(&*source) || timer(&*source) {
+        if attributed(&*source) || (!has_os(&*source) && timer(&*source)) {
             source
         } else {
             Box::new(Self {

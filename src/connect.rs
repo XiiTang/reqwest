@@ -758,7 +758,7 @@ impl ConnectorService {
                 }
 
                 let tls_connector = tokio_native_tls::TlsConnector::from(tls.clone());
-                let mut http = hyper_tls::HttpsConnector::from((
+                let http = hyper_tls::HttpsConnector::from((
                     Attributed::new(
                         http.with_socket_admission(self.socket_admission.clone()),
                         ConnectStage::Dial,
@@ -814,7 +814,7 @@ impl ConnectorService {
                     http.set_nodelay(true);
                 }
 
-                let mut http = hyper_rustls::HttpsConnector::from((
+                let http = hyper_rustls::HttpsConnector::from((
                     Attributed::new(
                         http.with_socket_admission(self.socket_admission.clone()),
                         ConnectStage::Dial,
@@ -961,7 +961,7 @@ impl ConnectorService {
             #[cfg(feature = "__native-tls")]
             Inner::NativeTls(_, tls) => {
                 let tls_connector = tokio_native_tls::TlsConnector::from(tls.clone());
-                let mut http = hyper_tls::HttpsConnector::from((
+                let http = hyper_tls::HttpsConnector::from((
                     Attributed::new(svc, ConnectStage::Dial, None),
                     tls_connector,
                 ));
@@ -984,7 +984,7 @@ impl ConnectorService {
             }
             #[cfg(feature = "__rustls")]
             Inner::RustlsTls { tls, .. } => {
-                let mut http = hyper_rustls::HttpsConnector::from((
+                let http = hyper_rustls::HttpsConnector::from((
                     Attributed::new(svc, ConnectStage::Dial, None),
                     tls.clone(),
                 ));
@@ -1945,6 +1945,29 @@ mod native_tls_conn {
     }
 
     #[cfg(unix)]
+    impl<T: Read + Write + Connection + Unpin> Connection
+        for NativeTlsConn<TokioIo<super::AttributedIo<T>>>
+    {
+        fn connected(&self) -> Connected {
+            let connected = self
+                .inner
+                .inner()
+                .get_ref()
+                .get_ref()
+                .get_ref()
+                .inner()
+                .connected();
+            #[cfg(feature = "__native-tls-alpn")]
+            match self.inner.inner().get_ref().negotiated_alpn().ok() {
+                Some(Some(alpn_protocol)) if alpn_protocol == b"h2" => connected.negotiated_h2(),
+                _ => connected,
+            }
+            #[cfg(not(feature = "__native-tls-alpn"))]
+            connected
+        }
+    }
+
+    #[cfg(unix)]
     impl Connection for NativeTlsConn<TokioIo<TokioIo<tokio::net::UnixStream>>> {
         fn connected(&self) -> Connected {
             let connected = Connected::new();
@@ -2119,6 +2142,25 @@ mod rustls_tls_conn {
         }
     }
     impl Connection for RustlsTlsConn<TokioIo<MaybeHttpsStream<TokioIo<TcpStream>>>> {
+        fn connected(&self) -> Connected {
+            if self.inner.inner().get_ref().1.alpn_protocol() == Some(b"h2") {
+                self.inner
+                    .inner()
+                    .get_ref()
+                    .0
+                    .inner()
+                    .connected()
+                    .negotiated_h2()
+            } else {
+                self.inner.inner().get_ref().0.inner().connected()
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl<T: Read + Write + Connection + Unpin> Connection
+        for RustlsTlsConn<TokioIo<super::AttributedIo<T>>>
+    {
         fn connected(&self) -> Connected {
             if self.inner.inner().get_ref().1.alpn_protocol() == Some(b"h2") {
                 self.inner

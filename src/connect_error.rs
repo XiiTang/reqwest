@@ -243,7 +243,7 @@ mod tests {
     #[derive(Clone)]
     struct Connector(u8);
     impl Service<Uri> for Connector {
-        type Response = TokioIo<tokio::io::DuplexStream>;
+        type Response = TokioIo<super::super::Dialed>;
         type Error = BoxError;
         type Future = std::future::Ready<Result<Self::Response, BoxError>>;
         fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), BoxError>> {
@@ -259,7 +259,9 @@ mod tests {
             } else {
                 let (client, peer) = tokio::io::duplex(4096);
                 drop(peer);
-                Ok(TokioIo::new(client))
+                Ok(TokioIo::new(super::super::Dialed(
+                    sync_wrapper::SyncWrapper::new(Box::new(client)),
+                )))
             })
         }
     }
@@ -316,9 +318,13 @@ mod tests {
     #[tokio::test]
     async fn rustls_keeps_lower_ready_call_and_its_own_handshake_errors() {
         let tls = std::sync::Arc::new(
-            rustls::ClientConfig::builder()
-                .with_root_certificates(rustls::RootCertStore::empty())
-                .with_no_client_auth(),
+            rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth(),
         );
         backend(|lower| hyper_rustls::HttpsConnector::from((lower, tls.clone()))).await;
         let mut service = Attributed::new(
@@ -339,5 +345,47 @@ mod tests {
             ConnectStage::TlsSetup
         ));
         assert!(find::<Lower>(&*error).is_none());
+    }
+    #[cfg(feature = "__rustls")]
+    #[tokio::test]
+    async fn post_connect_name_failure_keeps_the_original_native_name_error() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(socket.read_u8().await.unwrap());
+            }
+            assert!(request.starts_with(b"CONNECT invalid_name:443 "));
+            socket.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await.unwrap();
+        });
+        let tls = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(rustls::RootCertStore::empty())
+        .with_no_client_auth();
+        let client = crate::Client::builder()
+            .use_preconfigured_tls(tls)
+            .proxy(crate::Proxy::all(format!("http://{proxy}")).unwrap())
+            .build()
+            .unwrap();
+        let error = client
+            .get("https://invalid_name/")
+            .send()
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(
+            find::<ConnectError>(&error).unwrap().stage(),
+            ConnectStage::TlsSetup
+        ));
+        assert!(find::<ConnectError>(&error).unwrap().proxy().is_none());
+        assert!(find::<rustls_pki_types::InvalidDnsNameError>(&error).is_some());
+        drop(client);
+        peer.await.unwrap();
     }
 }

@@ -129,6 +129,7 @@ where {
             #[cfg(feature = "__tls")]
             user_agent: self.user_agent,
             simple_timeout: None,
+            connect_budget: self.timeout,
             #[cfg(feature = "socks")]
             socks_timeout: self.timeout,
             #[cfg(feature = "socks")]
@@ -157,6 +158,7 @@ where {
             log::trace!("windows_named_pipe() set, proxies are ignored");
         }
 
+        let budget_aware = base_service.dialer.as_ref().is_some_and(Dialer::budget_aware);
         if layers.is_empty() {
             // we have no user-provided layers, only use concrete types
             base_service.simple_timeout = self.timeout;
@@ -178,7 +180,7 @@ where {
         // now we handle the concrete stuff - any `connect_timeout`,
         // plus a final map_err layer we can use to cast default tower layer
         // errors to internal errors
-        match self.timeout {
+        match self.timeout.filter(|_| !budget_aware) {
             Some(timeout) => {
                 let service = ServiceBuilder::new()
                     .layer(TimeoutLayer::new(timeout))
@@ -547,6 +549,7 @@ pub(crate) struct ConnectorService {
     /// This lets us avoid an extra `Box::pin` indirection layer
     /// since `tokio::time::Timeout` is `Unpin`
     simple_timeout: Option<Duration>,
+    connect_budget: Option<Duration>,
     #[cfg(feature = "__tls")]
     nodelay: bool,
     #[cfg(feature = "__tls")]
@@ -936,11 +939,40 @@ impl ConnectorService {
             .dialer
             .clone()
             .expect("connect dialed must have a dialer");
+        let Dialer::Plain(dial) = dialer else {
+            unreachable!("budget-aware dialers use connect_dialed_with_info");
+        };
         let svc = tower::service_fn(move |dst: Uri| {
-            let dialing = (dialer.0)(dst);
+            let dialing = dial(dst);
             async move { dialing.await.map(TokioIo::new) }
         });
-        let is_proxy = false;
+        self.connect_dialed_over(dst, svc, false).await
+    }
+
+    async fn connect_dialed_with_info(self, dst: Uri) -> Result<Conn, BoxError> {
+        let Some(Dialer::WithInfo(dial)) = &self.dialer else {
+            unreachable!("only budget-aware dialers enter this path");
+        };
+        // Caller acquisition is outside the transport timeout. Only its returned
+        // remainder bounds our existing origin TLS path, including a zero budget.
+        let (stream, remaining) = dial(dst.clone(), self.connect_budget)
+            .await
+            .map_err(|error| ConnectError::wrap(ConnectStage::Dial, None, Box::new(error)))?;
+        let is_proxy = stream.is_proxy;
+        let mut stream = Some(stream);
+        let svc = tower::service_fn(move |_: Uri| {
+            std::future::ready(Ok::<_, io::Error>(TokioIo::new(
+                stream.take().expect("TLS connector calls supplied stream once"),
+            )))
+        });
+        with_timeout(self.connect_dialed_over(dst, svc, is_proxy), remaining).await
+    }
+
+    async fn connect_dialed_over<S>(self, dst: Uri, svc: S, is_proxy: bool) -> Result<Conn, BoxError>
+    where
+        S: Service<Uri, Response = TokioIo<Dialed>, Error = io::Error> + Send + 'static,
+        S::Future: Send + 'static,
+    {
         match self.inner {
             #[cfg(not(feature = "__tls"))]
             Inner::Http(..) => {
@@ -1208,7 +1240,10 @@ impl Service<Uri> for ConnectorService {
         let timeout = self.simple_timeout;
 
         // A caller's dialer replaces TCP and skips proxies.
-        if self.dialer.is_some() {
+        if let Some(dialer) = &self.dialer {
+            if dialer.budget_aware() {
+                return Box::pin(self.clone().connect_dialed_with_info(dst));
+            }
             return Box::pin(with_timeout(self.clone().connect_dialed(dst), timeout));
         }
 
@@ -1366,23 +1401,63 @@ impl<T> TlsInfoFactory for tokio_rustls::client::TlsStream<TokioIo<AttributedIo<
 // ===== Dialed =====
 
 type DialFuture = Pin<Box<dyn Future<Output = io::Result<Dialed>> + Send>>;
+type InfoDialFuture = Pin<Box<dyn Future<Output = io::Result<(Dialed, Option<Duration>)>> + Send>>;
+type InfoDial = dyn Fn(Uri, Option<Duration>) -> InfoDialFuture + Send + Sync;
 
 /// A caller-supplied source of connection byte streams.
 #[derive(Clone)]
-pub(crate) struct Dialer(Arc<dyn Fn(Uri) -> DialFuture + Send + Sync>);
+pub(crate) enum Dialer {
+    Plain(Arc<dyn Fn(Uri) -> DialFuture + Send + Sync>),
+    WithInfo(Arc<InfoDial>),
+}
 
 impl Dialer {
+    fn budget_aware(&self) -> bool {
+        matches!(self, Self::WithInfo(_))
+    }
+
     pub(crate) fn new<F, Fut, S>(dial: F) -> Self
     where
         F: Fn(Uri) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = io::Result<S>> + Send + 'static,
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
     {
-        Dialer(Arc::new(move |dst| {
+        Self::Plain(Arc::new(move |dst| {
             let dialing = dial(dst);
             Box::pin(async move {
                 let stream = dialing.await?;
-                Ok(Dialed(sync_wrapper::SyncWrapper::new(Box::new(stream))))
+                Ok(Dialed {
+                    io: sync_wrapper::SyncWrapper::new(Box::new(stream)),
+                    is_proxy: false,
+                    metadata: Arc::new(Connected::new),
+                })
+            })
+        }))
+    }
+
+    pub(crate) fn with_info<F, Fut, S, T>(dial: F) -> Self
+    where
+        F: Fn(Uri, Option<Duration>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = io::Result<(S, bool, T, Option<Duration>)>> + Send + 'static,
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
+        T: Clone + Send + Sync + 'static,
+    {
+        Self::WithInfo(Arc::new(move |dst, budget| {
+            let dialing = dial(dst, budget);
+            Box::pin(async move {
+                let (stream, is_proxy, facts, remaining) = dialing.await?;
+                if !match (budget, remaining) {
+                    (Some(input), Some(left)) => left <= input,
+                    (None, None) => true,
+                    _ => false,
+                } {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "dialer returned an invalid connect budget"));
+                }
+                Ok((Dialed {
+                    io: sync_wrapper::SyncWrapper::new(Box::new(stream)),
+                    is_proxy,
+                    metadata: Arc::new(move || Connected::new().proxy(is_proxy).extra(facts.clone())),
+                }, remaining))
             })
         }))
     }
@@ -1393,7 +1468,11 @@ impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin> DialedIo fo
 
 /// A byte stream a caller's dialer opened. Only `&mut` reaches it, so a
 /// stream that is `Send` but not `Sync` can back a pooled connection.
-pub(crate) struct Dialed(sync_wrapper::SyncWrapper<Box<dyn DialedIo>>);
+pub(crate) struct Dialed {
+    io: sync_wrapper::SyncWrapper<Box<dyn DialedIo>>,
+    is_proxy: bool,
+    metadata: Arc<dyn Fn() -> Connected + Send + Sync>,
+}
 
 impl tokio::io::AsyncRead for Dialed {
     fn poll_read(
@@ -1401,7 +1480,7 @@ impl tokio::io::AsyncRead for Dialed {
         cx: &mut Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        Pin::new(self.get_mut().0.get_mut()).poll_read(cx, buf)
+        Pin::new(self.get_mut().io.get_mut()).poll_read(cx, buf)
     }
 }
 
@@ -1411,19 +1490,19 @@ impl tokio::io::AsyncWrite for Dialed {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(self.get_mut().0.get_mut()).poll_write(cx, buf)
+        Pin::new(self.get_mut().io.get_mut()).poll_write(cx, buf)
     }
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(self.get_mut().0.get_mut()).poll_flush(cx)
+        Pin::new(self.get_mut().io.get_mut()).poll_flush(cx)
     }
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(self.get_mut().0.get_mut()).poll_shutdown(cx)
+        Pin::new(self.get_mut().io.get_mut()).poll_shutdown(cx)
     }
 }
 
 impl Connection for Dialed {
     fn connected(&self) -> Connected {
-        Connected::new()
+        (self.metadata)()
     }
 }
 
@@ -2026,7 +2105,7 @@ mod native_tls_conn {
 
     impl Connection for NativeTlsConn<TokioIo<TokioIo<super::Dialed>>> {
         fn connected(&self) -> Connected {
-            let connected = Connected::new();
+            let connected = self.inner.inner().get_ref().get_ref().get_ref().inner().connected();
             #[cfg(feature = "__native-tls-alpn")]
             match self.inner.inner().get_ref().negotiated_alpn().ok() {
                 Some(Some(alpn_protocol)) if alpn_protocol == b"h2" => connected.negotiated_h2(),

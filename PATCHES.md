@@ -193,3 +193,59 @@ Regression evidence on macOS arm64, Rust 1.98.1, through build-slot with consume
 - `cargo fmt --all --check`: exit 0.
 
 The established proxy TLS adapter wraps the backend result before CONNECT receives bytes, and remains underneath nested origin TLS; forwarding uses the same returned-error context. It changes only actual error results. Boundless's targeted declared-hop, initial/header/trailer, body/readiness and TLS-record effects use the corresponding Git pins. Pre-landing lanes remain the landing owner's gate.
+
+## Supplied-stream facts, remaining budget and selected-peer admission (Access limits R4)
+
+`ClientBuilder::dialer_with_info` replaces raw transport like the existing dialer,
+but its callback receives the configured connect budget and returns a stream,
+forwarding-proxy bit, clonable caller metadata and remaining budget. Reqwest erases
+only the metadata type; `Dialed::connected()` rebuilds `Connected::new().proxy(bit)
+.extra(facts.clone())`, following upstream hyper-util's TcpStream pattern. No
+public Connected Clone or shared-poison contract is added. Origin TLS/verbose
+wrappers retain these facts and add their actual ALPN; native TLS delegates to
+its wrapped stream like its existing TCP wrapper. Conn preserves the supplied
+proxy bit, so HTTP forwarding keeps absolute-form instead of requiring CONNECT.
+
+Upstream's configured simple timeout or outer tower timeout encloses the entire
+connect service. That remains true for built-in transports and ordinary dialers.
+Only the new budget-aware callback runs outside those wrappers: its contract
+accounts raw transport time while caller acquisition may await under the caller's
+own cancellation/deadline. Both service construction paths retain the configured
+amount. The existing with_timeout bounds origin TLS by only the returned
+remainder, including zero; a finite remainder cannot increase and None remains
+None. Explicit user layers retain their own timeout contracts. No timer task,
+retry or policy owner is introduced. Raw dial errors retain Dial attribution,
+TLS errors retain the existing attribution, timeout markers and source chains.
+Dropping the foreground request drops its dial normally.
+
+`RequestBuilder::connection_admission` forwards hyper-util's generic per-request
+extension through request conversion. It has no credential/policy knowledge.
+`connection_guard` composes the existing per-request capture and Hyper dispatch
+guard: connection policy always runs before dispatch_guard, regardless of setter
+order. It does not replace the original guard. Callback refusal sends no HTTP
+request or caller reservation and retains its source; existing final-guard
+connection-close behavior is unchanged. HTTP/3 has no legacy selected metadata
+and explicitly refuses these hooks rather than dispatching without them.
+
+`tests/dialer_info.rs` exercises forwarding, caller metadata through pooling and
+both TLS backends with actual HTTP/2 ALPN, both guard orders, pending caller
+acquisition longer than the connect budget in simple/layered service construction,
+only-remaining-time origin TLS including zero, and the public budget contract.
+Hyper-util's owned-peer regressions cover admission cancellation, concurrent H2
+selection and foreground dial lifetime; the existing dialer, mTLS/proxy TLS,
+request-target, source attribution, SOCKS, body-completion/socket ownership and
+reused-retry tests are retained.
+
+On macOS arm64 with consumer Rust1.97.0 and its pinned hyper/h2/rustls, the complete
+enabled rustls,socks,http2,json,stream,multipart suite passes (191 passed, four
+ignored, including docs). The five new info-dialer regressions also pass with
+Rustls and native-tls enabled, exercising both backends. Formatting passes.
+Strict Clippy exits101 on both untouched1664f3ab and this patch with identical
+diagnostic message multisets (one library diagnostic and25 library-test
+diagnostics for this feature set). No lint is suppressed or unrelated code
+repaired. The older dialer mTLS fixture assumes the Rustls backend; running that
+fixture with native-tls simultaneously selects an incompatible identity on the
+untouched path, so it is run in its original Rustls configuration. Native info
+metadata/ALPN has its own explicit backend regression.
+The no-TLS and native-tls-no-alpn library builds also pass; their unchanged
+feature-specific unused-item warnings are recorded separately from strict Clippy.

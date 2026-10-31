@@ -1890,6 +1890,27 @@ impl ClientBuilder {
         self
     }
 
+    /// Supply a raw stream, forwarding-proxy flag, clonable connection metadata
+    /// and remaining transport budget. Replaces TCP, DNS and proxy options like
+    /// [`Self::dialer`]; origin TLS and ALPN still run over the supplied stream.
+    ///
+    /// The callback receives the configured connect timeout. It owns transport
+    /// time accounting and may exclude caller acquisition waits. A finite
+    /// remainder must not exceed its input; `None` must remain `None`. Origin
+    /// TLS uses only the remainder, including zero. The callback is not wrapped
+    /// by reqwest's connect timeout; explicit connector layers keep their own
+    /// contracts. Dropping the connect future cancels the callback normally.
+    pub fn dialer_with_info<F, Fut, S, T>(mut self, dial: F) -> ClientBuilder
+    where
+        F: Fn(Uri, Option<Duration>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = std::io::Result<(S, bool, T, Option<Duration>)>> + Send + 'static,
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
+        T: Clone + Send + Sync + 'static,
+    {
+        self.config.dialer = Some(crate::connect::Dialer::with_info(dial));
+        self
+    }
+
     /// Set that all connections will use this Unix socket.
     ///
     /// If a request URI uses the `https` scheme, TLS will still be used over
@@ -2735,6 +2756,10 @@ impl Client {
             }
         };
         let request_guard = extensions.get::<hyper::ext::RequestGuard>().cloned();
+        let connection_guard = extensions.get::<super::request::ConnectionGuard>().cloned();
+        let connection_admission = extensions
+            .get::<hyper_util::client::legacy::connect::ConnectionAdmission>()
+            .cloned();
 
         let body = body.unwrap_or_else(Body::empty);
 
@@ -2751,6 +2776,9 @@ impl Client {
             http::Version::HTTP_3 if self.inner.h3_client.is_some() => {
                 let mut req = builder.body(body).expect("valid request parts");
                 *req.headers_mut() = headers.clone();
+                if connection_guard.is_some() || connection_admission.is_some() {
+                    return Pending::new_err(error::request("connection admission is not supported for HTTP/3"));
+                }
                 if let Some(Err(error)) = request_guard.as_ref().map(|guard| guard.check()) {
                     return Pending::new_err(error::request(error));
                 }
@@ -2760,7 +2788,23 @@ impl Client {
             _ => {
                 let mut req = builder.body(body).expect("valid request parts");
                 *req.headers_mut() = headers.clone();
-                if let Some(guard) = request_guard {
+                if let Some(admission) = connection_admission {
+                    req.extensions_mut().insert(admission);
+                }
+                if let Some(policy) = connection_guard {
+                    let capture = hyper_util::client::legacy::connect::capture_connection(&mut req);
+                    req.extensions_mut().insert(hyper::ext::RequestGuard::new(move || {
+                        let metadata = capture.connection_metadata();
+                        let selected = metadata.as_ref().ok_or_else(|| {
+                            std::io::Error::other("selected connection metadata is missing")
+                        })?;
+                        (policy.0)(selected)?;
+                        if let Some(guard) = &request_guard {
+                            guard.check()?;
+                        }
+                        Ok::<_, crate::error::BoxError>(())
+                    }));
+                } else if let Some(guard) = request_guard {
                     req.extensions_mut().insert(guard);
                 }
                 let mut hyper = self.inner.hyper.clone();

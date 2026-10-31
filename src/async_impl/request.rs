@@ -172,6 +172,10 @@ impl Request {
     }
 }
 
+type ConnectionCheck = dyn Fn(&hyper_util::client::legacy::connect::Connected) -> Result<(), crate::error::BoxError> + Send + Sync;
+#[derive(Clone)]
+pub(super) struct ConnectionGuard(pub(super) std::sync::Arc<ConnectionCheck>);
+
 impl RequestBuilder {
     /// Check authority immediately before this request's head is dispatched,
     /// after connection, pool and readiness waits. A refusal returns its error
@@ -184,6 +188,40 @@ impl RequestBuilder {
         if let Ok(ref mut req) = self.request {
             req.extensions_mut()
                 .insert(hyper::ext::RequestGuard::new(check));
+        }
+        self
+    }
+
+    /// Await admission of this request's selected connection before dispatch.
+    /// Refusal is unsent, preserves its source and is never retried. The callback
+    /// runs in the request future; cancellation releases the normal pool lease.
+    /// Requests using it keep dialing in the foreground, without a losing dial.
+    pub fn connection_admission<F, Fut, E>(mut self, admit: F) -> RequestBuilder
+    where
+        F: Fn(hyper_util::client::legacy::connect::Connected) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), E>> + Send + 'static,
+        E: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        if let Ok(ref mut req) = self.request {
+            req.extensions_mut().insert(
+                hyper_util::client::legacy::connect::ConnectionAdmission::new(admit),
+            );
+        }
+        self
+    }
+
+    /// Check this request's selected connection after readiness waits, before
+    /// HTTP dispatch. This check always precedes [`Self::dispatch_guard`],
+    /// independent of builder order; neither guard replaces the other.
+    pub fn connection_guard<F, E>(mut self, check: F) -> RequestBuilder
+    where
+        F: Fn(&hyper_util::client::legacy::connect::Connected) -> Result<(), E> + Send + Sync + 'static,
+        E: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        if let Ok(ref mut req) = self.request {
+            req.extensions_mut().insert(ConnectionGuard(std::sync::Arc::new(move |connected| {
+                check(connected).map_err(Into::into)
+            })));
         }
         self
     }

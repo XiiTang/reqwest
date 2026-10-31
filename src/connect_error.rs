@@ -273,9 +273,11 @@ mod tests {
             } else {
                 let (client, peer) = tokio::io::duplex(4096);
                 drop(peer);
-                Ok(TokioIo::new(super::super::Dialed(
-                    sync_wrapper::SyncWrapper::new(Box::new(client)),
-                )))
+                Ok(TokioIo::new(super::super::Dialed {
+                    io: sync_wrapper::SyncWrapper::new(Box::new(client)),
+                    is_proxy: false,
+                    metadata: std::sync::Arc::new(super::super::Connected::new),
+                }))
             })
         }
     }

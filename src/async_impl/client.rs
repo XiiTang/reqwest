@@ -2737,14 +2737,10 @@ impl Client {
             Ok(uri) => uri,
             _ => return Pending::new_err(error::url_invalid_uri(url)),
         };
-        let uri = match extensions.get::<super::request::ExactPath>() {
+        let uri = match extensions.get::<super::request::ExactTarget>() {
             None => uri,
-            Some(super::request::ExactPath(path)) => {
+            Some(super::request::ExactTarget(target)) => {
                 let mut parts = uri.into_parts();
-                let target = match url.query() {
-                    Some(query) => format!("{path}?{query}"),
-                    None => path.clone(),
-                };
                 parts.path_and_query = match target.parse() {
                     Ok(target) => Some(target),
                     Err(_) => return Pending::new_err(error::url_invalid_uri(url)),

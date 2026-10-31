@@ -52,16 +52,33 @@ upstream release, retain only still-needed changes, and run this regression plus
 Boundless's transport tests. Remove the fork override when an official release
 provides the same behavior and downstream regressions pass.
 
-## Request dispatch guard and exact path
+## Request dispatch guard and exact request target
 
 `RequestBuilder::dispatch_guard` installs a caller-owned check that Hyper runs
 immediately before dispatching this request's head, after pool, connection and
-readiness waits. `RequestBuilder::exact_path` sends an absolute path exactly as
-written, keeping `.`/`..` segments and their percent-encoded forms that `Url`
-would resolve, while the URL keeps the scheme, authority and query. Boundless
-uses the guard to reserve a single-use upstream OAuth refresh token only when the
-request is actually dispatched, and the exact path for S3/OSS object keys. Run
+readiness waits. `RequestBuilder::exact_path_and_query` sends an absolute path
+and query exactly as written, while the URL keeps the scheme and authority:
+`.`/`..` segments and their percent-encoded forms that `Url` would resolve, and
+query octets `Url` would percent-encode in an `http(s)` URL (`'` and non-ASCII,
+url 2.5.8 `parser.rs:45-46`). Upstream builds the request target only from the
+`Url`'s serialization (`try_uri(&url)` in `Client::execute_request`), and its
+`http::Request` conversion re-parses the URI into a `Url` too, so no public API
+sends a target the parser would change. Boundless uses the guard to reserve a
+single-use upstream OAuth refresh token only when the request is actually
+dispatched, the exact path for S3/OSS object keys, and the exact query for a
+`b.forward` request, whose query goes on as the caller sent it (#368). Run
 `cargo test --test request_target`.
+
+Regression evidence on macOS arm64 through build-slot, on 3aae0ff7 (the
+supplied-stream and selected-peer admission patch below), consumer patches
+selecting Boundless's pinned hyper 7c685689, rustls, hyper-util ecef514b and h2:
+`cargo test -p reqwest --no-default-features --features rustls,socks,http2
+--config <consumer patches> --test socket_ownership --test socks_addresses
+--test proxy_tls --test executor --test dialer --test request_target --test
+dialer_info`: exit 0, nineteen passed;
+`exact_target_keeps_dot_segments_and_query_octets` receives
+`?x-id=PutObject&name=O'Reilly&q=café` raw where the `Url` alone sends
+`O%27Reilly` and `caf%C3%A9`.
 
 
 ## SOCKS local DNS address attempts (2026-10-14)

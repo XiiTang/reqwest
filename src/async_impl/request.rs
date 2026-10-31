@@ -32,9 +32,9 @@ pub struct Request {
     extensions: Extensions,
 }
 
-/// The request target's path exactly as the caller wrote it.
+/// The request target's path and query exactly as the caller wrote them.
 #[derive(Clone, Debug)]
-pub(crate) struct ExactPath(pub(crate) String);
+pub(crate) struct ExactTarget(pub(crate) String);
 
 /// A builder to construct the properties of a `Request`.
 ///
@@ -226,19 +226,21 @@ impl RequestBuilder {
         self
     }
 
-    /// Send this absolute path instead of the URL's normalized one. Dot
-    /// segments (`.`, `..` and their percent-encoded forms) are sent as written,
-    /// as an S3 object key requires. The URL still supplies the scheme,
-    /// authority and query; the path carries no query or fragment.
-    pub fn exact_path(mut self, path: &str) -> RequestBuilder {
-        let valid = path.starts_with('/')
-            && !path.contains(['?', '#'])
-            && http::uri::PathAndQuery::try_from(path).is_ok();
+    /// Send this absolute path and query instead of the URL's normalized and
+    /// percent-encoded ones. Dot segments (`.`, `..` and their percent-encoded
+    /// forms) are sent as written, as an S3 object key requires, and query
+    /// octets the URL parser would percent-encode (`'`, non-ASCII) as a
+    /// forwarding proxy received them. The URL still supplies the scheme and
+    /// authority; the target carries no fragment.
+    pub fn exact_path_and_query(mut self, target: &str) -> RequestBuilder {
+        let valid = target.starts_with('/')
+            && !target.contains('#')
+            && http::uri::PathAndQuery::try_from(target).is_ok();
         match self.request {
             Ok(ref mut req) if valid => {
-                req.extensions_mut().insert(ExactPath(path.to_owned()));
+                req.extensions_mut().insert(ExactTarget(target.to_owned()));
             }
-            Ok(_) => self.request = Err(crate::error::builder("invalid exact request path")),
+            Ok(_) => self.request = Err(crate::error::builder("invalid exact request target")),
             Err(_) => {}
         }
         self

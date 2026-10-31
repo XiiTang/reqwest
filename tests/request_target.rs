@@ -7,18 +7,24 @@ use std::sync::Arc;
 use support::server;
 
 #[tokio::test]
-async fn exact_path_keeps_dot_segments_and_query() {
+async fn exact_target_keeps_dot_segments_and_query_octets() {
     let server = server::http(move |req| async move {
         assert_eq!(
             req.uri().path_and_query().unwrap().as_str(),
-            "/bucket/folder/../%2E%2E/./file.txt?x-id=PutObject"
+            "/bucket/folder/../%2E%2E/./file.txt?x-id=PutObject&name=O'Reilly&q=caf\u{e9}"
         );
         http::Response::default()
     });
-    let url = format!("http://{}/bucket/file.txt?x-id=PutObject", server.addr());
+    // The URL alone would send `/bucket/file.txt?...name=O%27Reilly&q=caf%C3%A9`.
+    let url = format!(
+        "http://{}/bucket/file.txt?x-id=PutObject&name=O'Reilly&q=caf\u{e9}",
+        server.addr()
+    );
     let response = reqwest::Client::new()
         .put(&url)
-        .exact_path("/bucket/folder/../%2E%2E/./file.txt")
+        .exact_path_and_query(
+            "/bucket/folder/../%2E%2E/./file.txt?x-id=PutObject&name=O'Reilly&q=caf\u{e9}",
+        )
         .send()
         .await
         .unwrap();
@@ -26,11 +32,11 @@ async fn exact_path_keeps_dot_segments_and_query() {
 }
 
 #[tokio::test]
-async fn exact_path_rejects_a_query_or_relative_path() {
-    for path in ["bucket/file", "/bucket?x=1", "/bucket#f"] {
+async fn exact_target_rejects_a_fragment_or_relative_path() {
+    for path in ["bucket/file", "/bucket#f", "/bucket?x=1#f"] {
         let error = reqwest::Client::new()
             .get("http://127.0.0.1/")
-            .exact_path(path)
+            .exact_path_and_query(path)
             .send()
             .await
             .unwrap_err();

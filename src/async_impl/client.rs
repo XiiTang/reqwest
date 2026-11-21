@@ -791,34 +791,40 @@ impl ClientBuilder {
                             ));
                         }
 
-                        let verifier = if config.root_certs.is_empty() {
-                            rustls_platform_verifier::Verifier::new(provider.clone())
-                                .map_err(crate::error::builder)?
-                        } else {
-                            #[cfg(any(
-                                all(unix, not(target_os = "android")),
-                                target_os = "windows"
-                            ))]
-                            {
-                                rustls_platform_verifier::Verifier::new_with_extra_roots(
-                                    crate::tls::rustls_der(config.root_certs)?,
-                                    provider.clone(),
-                                )
-                                .map_err(crate::error::builder)?
-                            }
+                        // The default trust loads the platform's roots at the
+                        // first certificate check, not here: a client that never
+                        // makes a TLS connection never needs them. Supplied roots
+                        // are still validated here, together with the platform's.
+                        let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> =
+                            if config.root_certs.is_empty() {
+                                Arc::new(crate::tls::LazyPlatformVerifier::new(provider.clone()))
+                            } else {
+                                #[cfg(any(
+                                    all(unix, not(target_os = "android")),
+                                    target_os = "windows"
+                                ))]
+                                {
+                                    Arc::new(
+                                        rustls_platform_verifier::Verifier::new_with_extra_roots(
+                                            crate::tls::rustls_der(config.root_certs)?,
+                                            provider.clone(),
+                                        )
+                                        .map_err(crate::error::builder)?,
+                                    )
+                                }
 
-                            #[cfg(not(any(
-                                all(unix, not(target_os = "android")),
-                                target_os = "windows"
-                            )))]
-                            return Err(crate::error::builder(
-                                "rustls-platform-verifier could not load extra certs",
-                            ));
-                        };
+                                #[cfg(not(any(
+                                    all(unix, not(target_os = "android")),
+                                    target_os = "windows"
+                                )))]
+                                return Err(crate::error::builder(
+                                    "rustls-platform-verifier could not load extra certs",
+                                ));
+                            };
 
                         config_builder
                             .dangerous()
-                            .with_custom_certificate_verifier(Arc::new(verifier))
+                            .with_custom_certificate_verifier(verifier)
                     } else {
                         if config.crls.is_empty() {
                             config_builder.with_root_certificates(crate::tls::rustls_store(
@@ -2773,7 +2779,9 @@ impl Client {
                 let mut req = builder.body(body).expect("valid request parts");
                 *req.headers_mut() = headers.clone();
                 if connection_guard.is_some() || connection_admission.is_some() {
-                    return Pending::new_err(error::request("connection admission is not supported for HTTP/3"));
+                    return Pending::new_err(error::request(
+                        "connection admission is not supported for HTTP/3",
+                    ));
                 }
                 if let Some(Err(error)) = request_guard.as_ref().map(|guard| guard.check()) {
                     return Pending::new_err(error::request(error));
@@ -2789,17 +2797,18 @@ impl Client {
                 }
                 if let Some(policy) = connection_guard {
                     let capture = hyper_util::client::legacy::connect::capture_connection(&mut req);
-                    req.extensions_mut().insert(hyper::ext::RequestGuard::new(move || {
-                        let metadata = capture.connection_metadata();
-                        let selected = metadata.as_ref().ok_or_else(|| {
-                            std::io::Error::other("selected connection metadata is missing")
-                        })?;
-                        (policy.0)(selected)?;
-                        if let Some(guard) = &request_guard {
-                            guard.check()?;
-                        }
-                        Ok::<_, crate::error::BoxError>(())
-                    }));
+                    req.extensions_mut()
+                        .insert(hyper::ext::RequestGuard::new(move || {
+                            let metadata = capture.connection_metadata();
+                            let selected = metadata.as_ref().ok_or_else(|| {
+                                std::io::Error::other("selected connection metadata is missing")
+                            })?;
+                            (policy.0)(selected)?;
+                            if let Some(guard) = &request_guard {
+                                guard.check()?;
+                            }
+                            Ok::<_, crate::error::BoxError>(())
+                        }));
                 } else if let Some(guard) = request_guard {
                     req.extensions_mut().insert(guard);
                 }

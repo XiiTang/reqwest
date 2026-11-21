@@ -266,3 +266,47 @@ untouched path, so it is run in its original Rustls configuration. Native info
 metadata/ALPN has its own explicit backend regression.
 The no-TLS and native-tls-no-alpn library builds also pass; their unchanged
 feature-specific unused-item warnings are recorded separately from strict Clippy.
+
+## Platform trust loaded at the first TLS connection (Boundless #924)
+
+Upstream `v0.13.4` builds `rustls_platform_verifier::Verifier::new(provider)`
+inside `ClientBuilder::build` for every rustls client with the default trust
+(`src/async_impl/client.rs`, the `root_certs.is_empty()` arm). On Linux that
+constructor loads the native roots and fails when none load
+(rustls-platform-verifier 0.7 `src/verification/others.rs`), so on a host
+with no CA roots every client build fails, plain `http://` included, and the
+failure is an opaque builder error. curl sets up its certificate store per
+connection, after its ClientHello (`lib/vtls/openssl.c`,
+`Curl_ssl_setup_x509_store`); a plain transfer never loads CA material.
+
+In the default-trust arm only, the client now holds `LazyPlatformVerifier`
+(`src/tls.rs`). It builds the platform verifier at the first
+`verify_server_cert` and returns that verifier's verdict; a successful build
+serves the client's remaining connections, as the eager one did, and a failed
+build is not kept. A failure returns `rustls::Error::Other` holding the new
+public `reqwest::tls::PlatformTrustUnavailable` (its `source` is the
+verifier's error), so rustls aborts the handshake and no application byte is
+sent. Handshake signatures and supported schemes use the provider's
+`signature_verification_algorithms`, which is what the platform verifier
+delegates to. The extra-roots arm (`tls_certs_merge`, `add_root_certificate`
+without `tls_certs_only`) stays eager: it validates the supplied roots at build
+and does not fail on an empty native store. `tls_certs_only`, CRLs,
+`danger_accept_invalid_*`, the preconfigured backend, and the HTTPS-proxy
+config's reuse of the origin verifier `Arc` are unchanged; Apple and Windows
+constructors already consult the OS only when verifying.
+
+Regression: `tests/lazy_trust.rs`. On Linux, with `SSL_CERT_FILE=/dev/null`
+and an empty `SSL_CERT_DIR`, the client builds; a plain `http://` request
+answers; an `https://` request fails with `PlatformTrustUnavailable` in its
+chain and the TLS server reads no request; with roots present an untrusted
+server is an `InvalidCertificate`, not unavailable trust. On every platform a
+malformed supplied root still fails at build and merged fixture roots verify
+the server. On macOS arm64 (Linux-only assertions compiled out),
+`cargo test -p reqwest --no-fail-fast --no-default-features --features
+rustls,socks,http2 --config <consumer patches> --test lazy_trust --test
+proxy_tls --test dialer --test dialer_info --test executor --test
+request_target --test socket_ownership --test socks_addresses` passes all 20
+tests, with the consumer patches selecting Boundless's pinned hyper
+`d4d96689`, h2 `f93da546`, hyper-util `ecef514b` and rustls `c07a2f63`. The
+Linux assertions run through Boundless's Linux tests of the pinned revision.
+

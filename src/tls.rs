@@ -784,6 +784,124 @@ impl ServerCertVerifier for IgnoreHostname {
     }
 }
 
+/// The platform's certificate trust could not be loaded when a TLS
+/// connection needed it: for example, a Linux host with no readable CA roots.
+///
+/// The default rustls configuration builds its platform verifier at the
+/// first certificate it checks rather than with the client, so a client that
+/// never makes a TLS connection never needs the platform's trust. A
+/// connection whose verifier cannot be built fails its handshake with this
+/// error inside a [`rustls::Error::Other`], and nothing is sent on it.
+#[cfg(feature = "__rustls")]
+#[derive(Debug)]
+pub struct PlatformTrustUnavailable {
+    source: TLSError,
+}
+
+#[cfg(feature = "__rustls")]
+impl fmt::Display for PlatformTrustUnavailable {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("the platform's certificate trust is unavailable")
+    }
+}
+
+#[cfg(feature = "__rustls")]
+impl std::error::Error for PlatformTrustUnavailable {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// The platform verifier of the default trust configuration, built at the
+/// first certificate it checks. A successful build serves the client's
+/// remaining connections, as an eager one would; a failed build is not kept,
+/// so a later connection loads the platform's trust again.
+#[cfg(feature = "__rustls")]
+#[derive(Debug)]
+pub(crate) struct LazyPlatformVerifier {
+    provider: std::sync::Arc<rustls::crypto::CryptoProvider>,
+    built: std::sync::OnceLock<rustls_platform_verifier::Verifier>,
+}
+
+#[cfg(feature = "__rustls")]
+impl LazyPlatformVerifier {
+    pub(crate) fn new(provider: std::sync::Arc<rustls::crypto::CryptoProvider>) -> Self {
+        Self {
+            provider,
+            built: std::sync::OnceLock::new(),
+        }
+    }
+
+    fn verifier(&self) -> Result<&rustls_platform_verifier::Verifier, TLSError> {
+        if let Some(verifier) = self.built.get() {
+            return Ok(verifier);
+        }
+        let verifier =
+            rustls_platform_verifier::Verifier::new(self.provider.clone()).map_err(|source| {
+                TLSError::Other(rustls::OtherError(std::sync::Arc::new(
+                    PlatformTrustUnavailable { source },
+                )))
+            })?;
+        Ok(self.built.get_or_init(|| verifier))
+    }
+}
+
+#[cfg(feature = "__rustls")]
+impl ServerCertVerifier for LazyPlatformVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls_pki_types::CertificateDer<'_>,
+        intermediates: &[rustls_pki_types::CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<ServerCertVerified, TLSError> {
+        self.verifier()?.verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            now,
+        )
+    }
+
+    // The platform verifier checks handshake signatures with its provider's
+    // algorithms; these need no trust store, so they never build it.
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls_pki_types::CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TLSError> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls_pki_types::CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TLSError> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
 /// Hyper extension carrying extra TLS layer information.
 /// Made available to clients on responses when `tls_info` is set.
 #[derive(Clone)]
